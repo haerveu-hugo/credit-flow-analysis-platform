@@ -1,0 +1,30 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+runtime/
+logs/
+
+# 本地运行产生的临时文件、OCR缓存、导出报告，禁止提交客户资料
+tmp/
+outputs/*
+!outputs/.gitkeep
+!outputs/本地分析平台.html
+
+# 客户原始资料与生成件默认不提交
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.tif
+*.tiff
+
+# 大体积/本机专用依赖
+work/ocr_deps/

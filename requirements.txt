@@ -1,0 +1,13 @@
+pandas
+pdfplumber
+pypdf
+python-docx
+openpyxl
+reportlab
+pillow
+rapidocr_onnxruntime
+opencv-python
+numpy
+xlrd
+pyyaml
+onnxruntime
