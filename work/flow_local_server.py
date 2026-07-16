@@ -725,7 +725,10 @@ def extract_pdf_text(path: Path, passwords: list[str] | None = None, should_canc
             return "\n".join(chunks), password
         except Exception as exc:
             last_error = str(exc)
-            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+            error_text = f"{type(exc).__name__}: {last_error}"
+            if (not password and len(passwords) > 1) or re.search(r"password|encrypted|加密|密码|PdfminerException", error_text, re.I):
+                continue
+            if not re.search(r"password|encrypted|加密|密码", error_text, re.I):
                 return "", password
     if len(passwords) <= 1 and not passwords[0]:
         raise PasswordRequiredError(path.name)
@@ -992,6 +995,8 @@ def extract_amounts_from_line(line: str) -> list[float]:
 
 def clean_counterparty_text(text: str) -> str:
     text = normalize_text(text)
+    text = re.sub(r"^(?:[A-Fa-f0-9]\s*){1,8}(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])[A-Fa-f0-9](?=[\u4e00-\u9fff])", "", text)
     text = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', text)
     text = re.sub(r"\b[A-Z]\d{6,}\b.*$", "", text)
     text = re.sub(r"\b(?:电子商务|超级网银|掌上银行|柜面|网上银行|自助终端|其他)\b.*$", "", text)
@@ -1125,7 +1130,13 @@ def raw_pipe_cells(line: str) -> list[str]:
 
 def noisy_signed_money(value: str) -> float | None:
     text = normalize_money_fragments(value)
-    signed = extract_signed_amounts_from_line(text)
+    signed = []
+    for match in re.finditer(r"[+-]\s*(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d{1,3})?", text):
+        amount = money_to_float(match.group(0).replace(" ", ""))
+        if amount is not None:
+            signed.append(amount)
+    if not signed:
+        signed = extract_signed_amounts_from_line(text)
     if signed:
         return signed[-1]
     candidates = re.findall(r"(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{1,3}", text)
@@ -1242,11 +1253,14 @@ def parse_bank_pipe_table_line(line: str, account: str, source: str) -> dict | N
         balance = noisy_balance_money(cells[9])
         if amount is None:
             return None
+        counterparty = clean_counterparty_text(cells[10] if len(cells) > 10 else "")
+        counterparty_account = normalize_text(cells[11] if len(cells) > 11 else "")
+        channel = normalize_text(cells[12] if len(cells) > 12 else "")
         return make_txn(
             date=parse_date(icbc_time),
             account=account,
-            counterparty=cells[7] or "工商银行",
-            summary=" ".join(cell for cell in [cells[6], cells[10]] if cell),
+            counterparty=counterparty or counterparty_account or "工商银行",
+            summary=" ".join(cell for cell in [cells[6], channel, f"对方账号:{counterparty_account}" if counterparty_account else ""] if cell),
             income=amount if amount > 0 else None,
             expense=abs(amount) if amount < 0 else None,
             amount=amount,
@@ -1758,6 +1772,12 @@ def repair_running_balances(txns: list[dict], tolerance: float = 5.0) -> list[di
                     txn["direction"] = "收入"
                     income, expense = corrected, 0.0
         expected = round(previous + income - expense, 2) if previous is not None else None
+        if expected is not None and balance is not None and abs(float(balance) - expected) > tolerance:
+            noisy_balance = f"{abs(float(balance)):.2f}"
+            expected_balance = f"{abs(float(expected)):.2f}"
+            if abs(float(balance)) > abs(float(expected)) and noisy_balance.endswith(expected_balance):
+                txn["balance"] = expected
+                balance = expected
         if expected is not None and (balance is None or abs(float(balance) - expected) <= tolerance):
             txn["balance"] = expected
             balance = expected
