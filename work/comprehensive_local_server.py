@@ -240,6 +240,38 @@ def build_comprehensive_result(
         [item.get("relative_path") or item.get("name"), item.get("category_label"), item.get("reason"), item.get("status")]
         for item in file_records
     ]
+    credit_template_rows = []
+    credit_summary_iter = iter(credit_summaries)
+    for item in [record for record in file_records if record.get("category") == "credit"]:
+        summary = {}
+        if item.get("status") == "分析完成":
+            summary = next(credit_summary_iter, {}) or {}
+        credit_template_rows.append([
+            item.get("relative_path") or item.get("name"),
+            summary.get("name") or "",
+            summary.get("type") or "",
+            summary.get("report_date") or "未识别",
+            summary.get("risk") or "",
+            item.get("status") or "",
+        ])
+    flow_file_map = {normalize_text(item.get("filename")): item for item in flow_response.get("files") or []}
+    flow_template_rows = []
+    for item in [record for record in file_records if record.get("category") == "flow"]:
+        flow_file = flow_file_map.get(normalize_text(item.get("name"))) or {}
+        accounts_text = "、".join(flow_file.get("accounts") or []) or "未识别"
+        flow_template_rows.append([
+            item.get("relative_path") or item.get("name"),
+            accounts_text,
+            flow_file.get("source_mode") or "",
+            flow_file.get("transaction_count") or 0,
+            flow_file.get("unique_transaction_count") if flow_file.get("unique_transaction_count") is not None else flow_file.get("transaction_count") or 0,
+            item.get("status") or "",
+        ])
+    other_template_rows = [
+        [item.get("relative_path") or item.get("name"), item.get("reason"), item.get("status")]
+        for item in file_records
+        if item.get("category") == "other"
+    ]
     credit_rows = [[
         item.get("name"), item.get("type"), item.get("report_date") or "未识别", item.get("risk"),
         item.get("loan_count") or 0, item.get("personal_loan_balance") or 0, item.get("card_used") or 0,
@@ -265,6 +297,9 @@ def build_comprehensive_result(
             ["月均有效收入", avg_income],
             ["收入流水/贷款余额（参考）", coverage_ratio if coverage_ratio is not None else "不适用"],
         ]),
+        table_block("征信资料模板", ["文件", "客户/企业", "类型", "报告日期", "风险", "状态"], credit_template_rows),
+        table_block("流水资料模板", ["文件", "识别账户", "读取方式", "识别笔数", "去重后笔数", "状态"], flow_template_rows),
+        table_block("其他/跳过文件", ["文件", "判断依据", "状态"], other_template_rows),
         table_block("文件自动分类", ["文件", "分类", "判断依据", "状态"], classification_rows),
         table_block("征信汇总", ["客户/企业", "类型", "报告日期", "风险", "未结清笔数", "个人贷款余额", "信用卡已用", "企业借贷余额", "个人担保", "企业表外/担保", "逾期总额"], credit_rows),
         table_block("流水账户汇总", ["账户", "文件数", "月份数", "交易笔数", "有效收入", "有效支出"], account_rows),
@@ -297,6 +332,18 @@ def build_comprehensive_result(
         f"<tr><td>{td(row[0])}</td><td>{td(row[1])}</td><td>{td(row[2])}</td><td>{td(row[3])}</td></tr>"
         for row in classification_rows
     )
+    credit_template_html = "".join(
+        f"<tr><td>{td(row[0])}</td><td>{td(row[1])}</td><td>{td(row[2])}</td><td>{td(row[3])}</td><td>{td(row[4])}</td><td>{td(row[5])}</td></tr>"
+        for row in credit_template_rows
+    ) or '<tr><td colspan="6">未识别到征信资料</td></tr>'
+    flow_template_html = "".join(
+        f"<tr><td>{td(row[0])}</td><td>{td(row[1])}</td><td>{td(row[2])}</td><td>{row[3]}</td><td>{row[4]}</td><td>{td(row[5])}</td></tr>"
+        for row in flow_template_rows
+    ) or '<tr><td colspan="6">未识别到流水资料</td></tr>'
+    other_template_html = "".join(
+        f"<tr><td>{td(row[0])}</td><td>{td(row[1])}</td><td>{td(row[2])}</td></tr>"
+        for row in other_template_rows
+    ) or '<tr><td colspan="3">暂无其他/跳过文件</td></tr>'
     warning_html = "".join(f"<li>{td(item)}</li>" for item in warnings)
     detail_html = "".join(
         f'<section class="credit-detail"><h3>征信明细：{td(credit.result_summary(item).get("name") or f"第{idx}份")}</h3>{item.get("report_html") or ""}</section>'
@@ -308,10 +355,16 @@ def build_comprehensive_result(
       <h3>一、综合指标</h3>
       <table><thead><tr><th>贷款余额</th><th>信用卡已用</th><th>担保/表外余额</th><th>有效收入流水</th><th>月均有效收入</th><th>流水月份</th></tr></thead><tbody><tr><td>{money(loan_balance)}</td><td>{money(card_used)}</td><td>{money(guarantee_balance)}</td><td>{money(valid_income)}</td><td>{money(avg_income)}</td><td>{month_count}</td></tr></tbody></table>
       <h3>二、风险提示与复核建议</h3><ul>{warning_html}</ul>
-      <h3>三、文件自动分类</h3><table><thead><tr><th>文件</th><th>分类</th><th>判断依据</th><th>状态</th></tr></thead><tbody>{file_html}</tbody></table>
-      <h3>四、征信汇总</h3><table><thead><tr><th>客户/企业</th><th>类型</th><th>报告日期</th><th>风险</th><th>未结清笔数</th><th>个人贷款</th><th>信用卡已用</th><th>企业借贷</th><th>担保/表外</th><th>逾期总额</th></tr></thead><tbody>{credit_html}</tbody></table>
-      <h3>五、流水账户汇总</h3><table><thead><tr><th>账户</th><th>文件数</th><th>月份数</th><th>有效笔数</th><th>有效收入</th><th>有效支出</th></tr></thead><tbody>{account_html}</tbody></table>
-      <h3>六、流水月度汇总</h3><table><thead><tr><th>月份</th><th>有效笔数</th><th>有效收入</th><th>有效支出</th><th>净流水</th></tr></thead><tbody>{month_html}</tbody></table>
+      <h3>三、资料分类模板</h3>
+      <div class="class-grid">
+        <section class="class-card"><h4>征信资料模板</h4><p class="note">用于查看个人/企业征信文件是否识别成功，以及报告主体、日期和风险等级。</p><div class="table-wrap"><table><thead><tr><th>文件</th><th>客户/企业</th><th>类型</th><th>报告日期</th><th>风险</th><th>状态</th></tr></thead><tbody>{credit_template_html}</tbody></table></div></section>
+        <section class="class-card"><h4>流水资料模板</h4><p class="note">用于查看银行流水、微信/支付宝明细、Excel 流水等是否进入流水统计。</p><div class="table-wrap"><table><thead><tr><th>文件</th><th>识别账户</th><th>读取方式</th><th>识别笔数</th><th>去重后笔数</th><th>状态</th></tr></thead><tbody>{flow_template_html}</tbody></table></div></section>
+      </div>
+      <details class="other-files"><summary>其他/跳过文件</summary><table><thead><tr><th>文件</th><th>判断依据</th><th>状态</th></tr></thead><tbody>{other_template_html}</tbody></table></details>
+      <h3>四、文件自动分类明细</h3><table><thead><tr><th>文件</th><th>分类</th><th>判断依据</th><th>状态</th></tr></thead><tbody>{file_html}</tbody></table>
+      <h3>五、征信汇总</h3><table><thead><tr><th>客户/企业</th><th>类型</th><th>报告日期</th><th>风险</th><th>未结清笔数</th><th>个人贷款</th><th>信用卡已用</th><th>企业借贷</th><th>担保/表外</th><th>逾期总额</th></tr></thead><tbody>{credit_html}</tbody></table>
+      <h3>六、流水账户汇总</h3><table><thead><tr><th>账户</th><th>文件数</th><th>月份数</th><th>有效笔数</th><th>有效收入</th><th>有效支出</th></tr></thead><tbody>{account_html}</tbody></table>
+      <h3>七、流水月度汇总</h3><table><thead><tr><th>月份</th><th>有效笔数</th><th>有效收入</th><th>有效支出</th><th>净流水</th></tr></thead><tbody>{month_html}</tbody></table>
       <p class="note">本报告由本机自动识别生成。自动分类、OCR 字段、关键金额、交易性质和综合判断均建议结合原件及人工尽调复核。</p>
       {detail_html}
     </article>
@@ -527,9 +580,9 @@ def build_export(result: dict, fmt: str) -> tuple[bytes, str, str]:
 
 INDEX = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>征信与流水综合分析</title><style>
-:root{--ink:#172033;--muted:#66758a;--line:#d8dee8;--panel:#fff;--nav:#172232;--blue:#2d7d9a;--green:#247550;--red:#b42318;--shadow:0 12px 28px rgba(20,30,45,.08)}*{box-sizing:border-box}body{margin:0;background:#eef2f5;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.5}.shell{display:grid;grid-template-columns:360px minmax(0,1fr);min-height:100vh}.side{background:var(--nav);color:#fff;padding:22px}.main{padding:22px;min-width:0}.brand h1{font-size:22px;margin:0 0 6px}.brand p{font-size:13px;color:#c7d1df;margin:0 0 16px}.box{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);border-radius:9px;padding:14px;margin-bottom:14px}.drop{border:1px dashed rgba(255,255,255,.4);border-radius:8px;padding:18px;text-align:center;color:#dce6f1}.drop strong{display:block;color:#fff}.native-file,textarea,input{width:100%;margin-top:10px}textarea,input{border:1px solid rgba(255,255,255,.24);background:rgba(255,255,255,.08);color:#fff;border-radius:8px;padding:9px}textarea{min-height:72px}.file-name,.status{font-size:13px;color:#dce6f1;margin-top:10px;white-space:pre-wrap;word-break:break-all}.btn-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}button{border:0;border-radius:8px;padding:10px 14px;cursor:pointer}button.primary{background:var(--blue);color:#fff}button.ghost{background:transparent;border:1px solid rgba(255,255,255,.24);color:#fff}button:disabled{opacity:.55}.progress{height:10px;background:rgba(255,255,255,.16);border-radius:999px;overflow:hidden;margin-top:10px}.progress span{display:block;height:100%;width:0;background:#6cc49a}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.metric,.panel{background:#fff;border:1px solid var(--line);border-radius:9px;box-shadow:var(--shadow)}.metric{padding:14px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;font-size:24px;margin-top:8px}.metric small{color:var(--muted)}.panel{padding:16px;margin-bottom:16px;overflow:hidden}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.toolbar h2{font-size:18px;margin:0}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions button{background:#eef4f7;color:#245d72}.empty{color:var(--muted);background:#f4f7f9;border:1px dashed var(--line);padding:28px;text-align:center;border-radius:8px}table{border-collapse:collapse;width:100%;min-width:820px;margin:10px 0 18px}th,td{border:1px solid #cfd7e3;padding:8px;text-align:left;font-size:14px;vertical-align:top}th{background:#f3f6f9;color:#405065}.table-wrap{overflow:auto}.report-body h2{font-size:22px;margin:0}.report-body h3{font-size:16px;margin:22px 0 8px}.report-title{display:flex;justify-content:space-between;gap:12px}.pill{display:inline-flex;height:fit-content;border-radius:999px;padding:4px 10px;background:#eef4f7;color:#245d72}.note{font-size:13px;color:var(--muted)}.credit-detail{border-top:2px solid var(--line);margin-top:28px;padding-top:16px}.credit-detail .report-title{display:none}.debug{white-space:pre-wrap;font-size:12px;color:var(--muted);max-height:140px;overflow:auto}@media(max-width:980px){.shell{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}}@media(max-width:620px){.metrics{grid-template-columns:1fr}.main,.side{padding:14px}}@media print{.side,.actions,.debug{display:none}.shell{display:block}.main{padding:0}.panel,.metric{box-shadow:none}}
+:root{--ink:#172033;--muted:#66758a;--line:#d8dee8;--panel:#fff;--nav:#172232;--blue:#2d7d9a;--green:#247550;--red:#b42318;--shadow:0 12px 28px rgba(20,30,45,.08)}*{box-sizing:border-box}body{margin:0;background:#eef2f5;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.5}.shell{display:grid;grid-template-columns:360px minmax(0,1fr);min-height:100vh}.side{background:var(--nav);color:#fff;padding:22px}.main{padding:22px;min-width:0}.brand h1{font-size:22px;margin:0 0 6px}.brand p{font-size:13px;color:#c7d1df;margin:0 0 16px}.box{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);border-radius:9px;padding:14px;margin-bottom:14px}.template-mini h3{font-size:15px;margin:0 0 10px}.template-mini ul{margin:8px 0 0 18px;padding:0;color:#dce6f1;font-size:13px}.template-mini li{margin:5px 0}.drop{border:1px dashed rgba(255,255,255,.4);border-radius:8px;padding:18px;text-align:center;color:#dce6f1}.drop strong{display:block;color:#fff}.native-file,textarea,input{width:100%;margin-top:10px}textarea,input{border:1px solid rgba(255,255,255,.24);background:rgba(255,255,255,.08);color:#fff;border-radius:8px;padding:9px}textarea{min-height:72px}.file-name,.status{font-size:13px;color:#dce6f1;margin-top:10px;white-space:pre-wrap;word-break:break-all}.btn-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}button{border:0;border-radius:8px;padding:10px 14px;cursor:pointer}button.primary{background:var(--blue);color:#fff}button.ghost{background:transparent;border:1px solid rgba(255,255,255,.24);color:#fff}button:disabled{opacity:.55}.progress{height:10px;background:rgba(255,255,255,.16);border-radius:999px;overflow:hidden;margin-top:10px}.progress span{display:block;height:100%;width:0;background:#6cc49a}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.metric,.panel{background:#fff;border:1px solid var(--line);border-radius:9px;box-shadow:var(--shadow)}.metric{padding:14px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;font-size:24px;margin-top:8px}.metric small{color:var(--muted)}.panel{padding:16px;margin-bottom:16px;overflow:hidden}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.toolbar h2{font-size:18px;margin:0}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions button{background:#eef4f7;color:#245d72}.empty{color:var(--muted);background:#f4f7f9;border:1px dashed var(--line);padding:28px;text-align:center;border-radius:8px}table{border-collapse:collapse;width:100%;min-width:820px;margin:10px 0 18px}th,td{border:1px solid #cfd7e3;padding:8px;text-align:left;font-size:14px;vertical-align:top}th{background:#f3f6f9;color:#405065}.table-wrap{overflow:auto}.report-body h2{font-size:22px;margin:0}.report-body h3{font-size:16px;margin:22px 0 8px}.report-body h4{font-size:15px;margin:0 0 4px}.report-title{display:flex;justify-content:space-between;gap:12px}.pill{display:inline-flex;height:fit-content;border-radius:999px;padding:4px 10px;background:#eef4f7;color:#245d72}.note{font-size:13px;color:var(--muted)}.class-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0 12px}.class-card{border:1px solid var(--line);border-radius:9px;background:#fbfcfd;padding:12px;overflow:hidden}.class-card table{min-width:680px;margin-bottom:4px}.other-files{border:1px dashed var(--line);border-radius:9px;padding:10px 12px;background:#fff;margin-bottom:14px}.other-files summary{cursor:pointer;color:#405065;font-weight:600}.credit-detail{border-top:2px solid var(--line);margin-top:28px;padding-top:16px}.credit-detail .report-title{display:none}.debug{white-space:pre-wrap;font-size:12px;color:var(--muted);max-height:140px;overflow:auto}@media(max-width:980px){.shell{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}.class-grid{grid-template-columns:1fr}}@media(max-width:620px){.metrics{grid-template-columns:1fr}.main,.side{padding:14px}}@media print{.side,.actions,.debug{display:none}.shell{display:block}.main{padding:0}.panel,.metric,.class-card{box-shadow:none}}
 </style></head><body><div class="shell"><aside class="side"><div class="brand"><h1>客户综合分析</h1><p>选择一个同时包含征信和流水的客户文件夹，系统将在本机自动分类、分析并生成综合报告。</p></div>
-<section class="box"><form id="form"><div class="drop" id="drop"><strong>选择客户文件夹</strong><small>支持征信 PDF/图片与流水 PDF/Excel/图片</small></div><input id="folder" class="native-file" type="file" webkitdirectory directory multiple required><div id="fileName" class="file-name">尚未选择文件夹</div><label><small>文件密码（如有，每行一个）</small><textarea id="passwords" placeholder="可填写 PDF 或流水文件密码"></textarea></label><div class="btn-row"><button id="submitBtn" class="primary">自动分类并综合分析</button><button id="resetBtn" class="ghost" type="button">清空</button></div></form><div class="progress"><span id="progressBar"></span></div><div id="status" class="status">请选择客户文件夹。</div></section><p class="note" style="color:#c7d1df">无法可靠分类的文件会列为“其他/跳过”，不会影响其余文件。综合结论仅作辅助，关键数据仍需结合原件复核。</p></aside>
+<section class="box"><form id="form"><div class="drop" id="drop"><strong>选择客户文件夹</strong><small>支持征信 PDF/图片与流水 PDF/Excel/图片</small></div><input id="folder" class="native-file" type="file" webkitdirectory directory multiple required><div id="fileName" class="file-name">尚未选择文件夹</div><label><small>文件密码（如有，每行一个）</small><textarea id="passwords" placeholder="可填写 PDF 或流水文件密码"></textarea></label><div class="btn-row"><button id="submitBtn" class="primary">自动分类并综合分析</button><button id="resetBtn" class="ghost" type="button">清空</button></div></form><div class="progress"><span id="progressBar"></span></div><div id="status" class="status">请选择客户文件夹。</div></section><section class="box template-mini"><h3>分类查看模板</h3><ul><li><strong>征信资料：</strong>文件名含“征信、信用报告、人行报告”等，会进入征信汇总。</li><li><strong>流水资料：</strong>PDF/Excel/图片流水、交易明细、历史明细、微信/支付宝明细，会进入流水统计。</li><li><strong>其他资料：</strong>营业执照、合同、财报等默认跳过，不影响本次综合分析。</li></ul></section><p class="note" style="color:#c7d1df">无法可靠分类的文件会列为“其他/跳过”，不会影响其余文件。综合结论仅作辅助，关键数据仍需结合原件复核。</p></aside>
 <main class="main"><section class="metrics"><div class="metric"><span>综合判断</span><strong id="mRisk">-</strong><small>等待分析</small></div><div class="metric"><span>贷款余额</span><strong id="mLoan">-</strong><small>征信口径</small></div><div class="metric"><span>有效收入流水</span><strong id="mIncome">-</strong><small>自动剔除常见非经营项</small></div><div class="metric"><span>月均有效收入</span><strong id="mAvg">-</strong><small>按有效月份</small></div></section>
 <section class="panel"><div class="toolbar"><h2>综合报告</h2><div class="actions"><button id="pdfBtn" disabled>下载PDF</button><button id="wordBtn" disabled>下载Word</button><button id="excelBtn" disabled>下载Excel</button><button id="printBtn">打印</button></div></div><div id="result"><div class="empty">选择客户文件夹后，这里会显示征信、流水与综合风险提示。</div></div></section><section class="panel"><h2>处理诊断</h2><div id="debug" class="debug">等待分析。</div></section></main></div>
 <script>
