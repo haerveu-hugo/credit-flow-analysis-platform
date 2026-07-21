@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.haerveu.analysis.credit</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/haerveu/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3</string>
+    <string>/Users/haerveu/Documents/Codex/2026-06-24/wo/work/credit_local_server.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PORT</key>
+    <string>8789</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/haerveu/Documents/Codex/2026-06-24/wo</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/haerveu/Documents/Codex/2026-06-24/wo/outputs/launchd-credit.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/haerveu/Documents/Codex/2026-06-24/wo/outputs/launchd-credit.log</string>
+</dict>
+</plist>

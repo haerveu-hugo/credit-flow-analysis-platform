@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from urllib.parse import unquote
-
-
-ROOT = Path(__file__).resolve().parent.parent
-HUB_FILE = ROOT / "outputs" / "本地分析平台.html"
 
 DEFAULT_HUB_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本地分析平台</title><style>
 *{box-sizing:border-box}body{margin:0;background:#eef2f5;color:#162033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}header{min-height:64px;background:#20252d;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:10px 22px;gap:15px}h1{font-size:20px;margin:0;white-space:nowrap}.tabs{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}button,a.btn{border:0;border-radius:8px;background:#edf3f7;color:#1b4050;padding:10px 14px;cursor:pointer;text-decoration:none;font-size:14px}button.active{background:#2d7d9a;color:#fff}main{height:calc(100vh - 64px);display:grid;grid-template-rows:auto 1fr}.bar{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:12px 16px;background:#fff;border-bottom:1px solid #d7dee8}.hint{color:#677485;font-size:13px}.links{display:none;padding:16px;background:#fff;border-bottom:1px solid #d7dee8}.links a{display:inline-flex;margin:4px 8px 4px 0}.warn{display:none;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px;margin-left:12px;font-size:13px}iframe{width:100%;height:100%;border:0;background:#fff}@media(max-width:760px){header{align-items:flex-start;flex-direction:column}.tabs{justify-content:flex-start}main{height:calc(100vh - 116px)}}
@@ -18,15 +13,15 @@ const items={credit:{name:'征信分析',url:'http://127.0.0.1:8789/'},flow:{nam
 class HubHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = unquote(self.path.split("?", 1)[0])
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
         if path not in {"/", "/index.html", "/本地分析平台.html"}:
             self.send_error(404)
             return
 
-        try:
-            content = HUB_FILE.read_bytes()
-        except OSError as exc:
-            print(f"统一首页文件读取失败，使用内置首页：{exc}", flush=True)
-            content = DEFAULT_HUB_HTML
+        content = DEFAULT_HUB_HTML
 
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -37,6 +32,10 @@ class HubHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = unquote(self.path.split("?", 1)[0])
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
         if path not in {"/", "/index.html", "/本地分析平台.html"}:
             self.send_error(404)
             return
