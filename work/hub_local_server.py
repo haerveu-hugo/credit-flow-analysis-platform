@@ -3,11 +3,64 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
-DEFAULT_HUB_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本地分析平台</title><style>
-*{box-sizing:border-box}body{margin:0;background:#eef2f5;color:#162033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}header{min-height:64px;background:#20252d;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:10px 22px;gap:15px}h1{font-size:20px;margin:0;white-space:nowrap}.tabs{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}button,a.btn{border:0;border-radius:8px;background:#edf3f7;color:#1b4050;padding:10px 14px;cursor:pointer;text-decoration:none;font-size:14px}button.active{background:#2d7d9a;color:#fff}main{height:calc(100vh - 64px);display:grid;grid-template-rows:auto 1fr}.bar{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:12px 16px;background:#fff;border-bottom:1px solid #d7dee8}.hint{color:#677485;font-size:13px}.links{display:none;padding:16px;background:#fff;border-bottom:1px solid #d7dee8}.links a{display:inline-flex;margin:4px 8px 4px 0}.warn{display:none;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px;margin-left:12px;font-size:13px}iframe{width:100%;height:100%;border:0;background:#fff}@media(max-width:760px){header{align-items:flex-start;flex-direction:column}.tabs{justify-content:flex-start}main{height:calc(100vh - 116px)}}
-</style></head><body><header><h1>本地分析平台</h1><div class="tabs"><button data-key="credit">征信分析</button><button data-key="flow">流水统计</button><button data-key="financial">财务报表分析</button><button data-key="comprehensive">综合分析</button></div></header><main><div class="bar"><div><span class="hint" id="hint"></span><span class="warn" id="warn">如果内嵌页面空白，请点右侧“新窗口打开”。</span></div><a class="btn" id="openNew" target="_blank">新窗口打开</a></div><div class="links" id="links"></div><iframe id="frame"></iframe></main><script>
-const items={credit:{name:'征信分析',url:'http://127.0.0.1:8789/'},flow:{name:'流水统计',url:'http://127.0.0.1:8790/flow'},financial:{name:'财务报表分析',url:'http://127.0.0.1:8793/financial'},comprehensive:{name:'综合分析',url:'http://127.0.0.1:8792/comprehensive'}},frame=document.getElementById('frame'),hint=document.getElementById('hint'),openNew=document.getElementById('openNew'),links=document.getElementById('links'),warn=document.getElementById('warn');links.innerHTML=Object.values(items).map(x=>`<a class="btn" target="_blank" href="${x.url}">${x.name}</a>`).join('');function show(key){const x=items[key]||items.credit;frame.src=x.url;openNew.href=x.url;hint.textContent='当前：'+x.name;document.querySelectorAll('[data-key]').forEach(b=>b.classList.toggle('active',b.dataset.key===key));localStorage.setItem('analysisPlatformTab',key);setTimeout(()=>{warn.style.display='inline-block';links.style.display='block'},2500)}document.querySelectorAll('[data-key]').forEach(b=>b.onclick=()=>show(b.dataset.key));show(items[localStorage.getItem('analysisPlatformTab')]?localStorage.getItem('analysisPlatformTab'):'credit');
-</script></body></html>""".encode("utf-8")
+
+DEFAULT_HUB_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>本地分析平台</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#eef2f5;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.5}
+    header{background:#172232;color:#fff;padding:24px}
+    header h1{font-size:24px;margin:0 0 6px}
+    header p{color:#c7d1df;margin:0;font-size:14px}
+    main{max-width:1120px;margin:0 auto;padding:24px}
+    .notice{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:12px;padding:12px 14px;margin-bottom:18px}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+    .card{display:block;background:#fff;border:1px solid #d8dee8;border-radius:14px;padding:20px;text-decoration:none;color:#172033;box-shadow:0 10px 24px rgba(20,30,45,.08)}
+    .card:hover{border-color:#2d7d9a;transform:translateY(-1px)}
+    .card h2{font-size:20px;margin:0 0 8px}
+    .card p{margin:0;color:#66758a;font-size:14px}
+    .url{margin-top:14px;color:#2d7d9a;font-size:13px;word-break:break-all}
+    .footer{margin-top:18px;color:#66758a;font-size:13px}
+    @media(max-width:760px){.grid{grid-template-columns:1fr}header,main{padding:18px}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>本地分析平台</h1>
+    <p>这里是总入口。点击下面任一模块，会直接进入对应平台，不再内嵌显示，避免白屏或页面错位。</p>
+  </header>
+  <main>
+    <div class="notice">如果某个模块打不开，等 30 秒后刷新一次；后台守护会自动检查并拉起服务。</div>
+    <div class="grid">
+      <a class="card" href="http://127.0.0.1:8789/">
+        <h2>征信分析</h2>
+        <p>个人/企业征信、PDF/图片识别、报告下载。</p>
+        <div class="url">http://127.0.0.1:8789/</div>
+      </a>
+      <a class="card" href="http://127.0.0.1:8790/flow">
+        <h2>流水统计</h2>
+        <p>银行流水、微信/支付宝、PDF/Excel/图片识别和统计。</p>
+        <div class="url">http://127.0.0.1:8790/flow</div>
+      </a>
+      <a class="card" href="http://127.0.0.1:8793/financial">
+        <h2>财务报表分析</h2>
+        <p>PDF/Excel 财报识别，结合行业和经营情况分析。</p>
+        <div class="url">http://127.0.0.1:8793/financial</div>
+      </a>
+      <a class="card" href="http://127.0.0.1:8792/comprehensive">
+        <h2>综合分析</h2>
+        <p>选择客户文件夹，自动分类征信和流水并生成综合报告。</p>
+        <div class="url">http://127.0.0.1:8792/comprehensive</div>
+      </a>
+    </div>
+    <div class="footer">提示：这些链接只在本机使用，发给其他电脑不能直接打开。</div>
+  </main>
+</body>
+</html>""".encode("utf-8")
 
 
 class HubHandler(BaseHTTPRequestHandler):
@@ -22,7 +75,6 @@ class HubHandler(BaseHTTPRequestHandler):
             return
 
         content = DEFAULT_HUB_HTML
-
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
