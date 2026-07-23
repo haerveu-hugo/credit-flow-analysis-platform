@@ -747,6 +747,14 @@ def is_corporate_query_statement(text: str, filename: str = "") -> bool:
     )
 
 
+def is_abc_account_detail_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "账户明细" in content
+        and "交易时间 收入金额 支出金额 账户余额 对方账号 对方户名 交易用途 对方开户行 摘要" in content
+    )
+
+
 def join_pdf_words(words: list[dict], *, digits_only: bool = False) -> str:
     ordered = sorted(words, key=lambda w: (round(float(w.get("top", 0)) / 3), float(w.get("x0", 0))))
     text = " ".join(normalize_text(w.get("text", "")) for w in ordered if normalize_text(w.get("text", "")))
@@ -833,6 +841,95 @@ def extract_corporate_query_pdf(
                             balance=balance,
                             source=path.name,
                             raw_key=f"{page_no}:{idx}:{date_text}:{time_text}:{debit}:{credit}:{balance}:{counterparty}:{counterparty_account}:{summary}:{txn_type}",
+                            preserve_signed_columns=True,
+                        )
+                        if txn:
+                            txns.append(txn)
+            return dedupe_transactions(txns), password
+        except Exception as exc:
+            last_error = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+                raise
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def extract_abc_account_detail_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+) -> tuple[list[dict], str]:
+    """农业银行账户明细/明细回单固定列 PDF。
+
+    这类 PDF 的文字层会把同一行拆成多条视觉行；如果走通用文本规则，
+    “对方账号”会被误识别成交易金额。这里按页面坐标列解析。
+    """
+    passwords = passwords or [""]
+    last_error = ""
+    for password in passwords:
+        txns: list[dict] = []
+        account = infer_account_from_filename(path.name) or normalize_source_account(path.name)
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    page_text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                    header_account = re.search(r"账号[:：]\s*([0-9A-Za-z* -]{8,})", page_text)
+                    if header_account:
+                        account = normalize_account(header_account.group(1), account)
+                    words = page.extract_words(x_tolerance=1, y_tolerance=3, use_text_flow=False) or []
+                    starts = [
+                        word
+                        for word in words
+                        if float(word.get("x0", 999)) < 82
+                        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", normalize_text(word.get("text", "")))
+                    ]
+                    starts.sort(key=lambda w: float(w.get("top", 0)))
+                    for idx, start in enumerate(starts):
+                        date_text = normalize_text(start.get("text", ""))
+                        start_top = float(start.get("top", 0))
+                        next_top = float(starts[idx + 1].get("top", page.height)) if idx + 1 < len(starts) else float(page.height)
+                        block_top = max(72.0, start_top - 10.0)
+                        block_bottom = max(block_top + 1.0, next_top - 8.0)
+                        block = [
+                            word
+                            for word in words
+                            if block_top <= float(word.get("top", 0)) < block_bottom
+                            and not re.search(r"账户明细|账号[:：]|交易时间|收入金额|第\d+页", normalize_text(word.get("text", "")))
+                        ]
+                        time_words = [
+                            word
+                            for word in pdf_words_in_column(block, 0, 82)
+                            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", normalize_text(word.get("text", "")))
+                        ]
+                        time_text = normalize_text(time_words[0].get("text", "")) if time_words else ""
+                        income = money_to_float(join_pdf_words(pdf_words_in_column(block, 82, 145)))
+                        expense = money_to_float(join_pdf_words(pdf_words_in_column(block, 145, 205)))
+                        balance = money_to_float(join_pdf_words(pdf_words_in_column(block, 205, 265)))
+                        counterparty_account = join_pdf_words(pdf_words_in_column(block, 265, 330))
+                        counterparty = clean_counterparty_text(join_pdf_words(pdf_words_in_column(block, 330, 392)))
+                        purpose = join_pdf_words(pdf_words_in_column(block, 392, 455))
+                        counterparty_bank = join_pdf_words(pdf_words_in_column(block, 455, 525))
+                        summary = join_pdf_words(pdf_words_in_column(block, 525, 590))
+                        if income is None and expense is None:
+                            continue
+                        summary_parts = [purpose, summary, counterparty_bank]
+                        if counterparty_account:
+                            summary_parts.append(f"对方账号:{counterparty_account}")
+                        if time_text:
+                            summary_parts.append(time_text)
+                        txn = make_txn(
+                            date=parse_date(date_text),
+                            account=account,
+                            counterparty=counterparty or counterparty_account or counterparty_bank or "未识别",
+                            summary=" ".join(part for part in summary_parts if part),
+                            income=income,
+                            expense=expense,
+                            amount=None,
+                            balance=balance,
+                            source=path.name,
+                            raw_key=f"abc:{page_no}:{idx}:{date_text}:{time_text}:{income}:{expense}:{balance}:{counterparty_account}:{counterparty}:{purpose}:{summary}",
                             preserve_signed_columns=True,
                         )
                         if txn:
@@ -2185,6 +2282,13 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                 should_cancel=should_cancel,
             )
             source_mode = "PDF文字层-企业交易查询"
+        elif is_abc_account_detail_statement(text, path.name):
+            txns, _ = extract_abc_account_detail_pdf(
+                path,
+                passwords=[used_password] if used_password else passwords,
+                should_cancel=should_cancel,
+            )
+            source_mode = "PDF文字层-农行账户明细"
         else:
             txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
         text_length = len(text)
