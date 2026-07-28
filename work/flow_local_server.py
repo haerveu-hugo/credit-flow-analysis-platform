@@ -280,7 +280,7 @@ def infer_account_from_text(text: str, fallback: str = "") -> str:
         suffix = re.sub(r"[^A-Za-z0-9]", "", wechat_id)[-4:] or wechat_id[-4:]
         return f"{name}微信({suffix})"
     for pattern in [
-        r"(?:本方账号|交易账号|账\s*号|账户(?:号码|账号|号)?|卡\s*号|户号)[:： \t]*([0-9* ]{6,})",
+        r"(?:本方账号|交易账号|账\s*号|账户(?:号码|账号|号)?|卡\s*号|户号)[:： \t]*([0-9* -]{6,})",
         r"(?<!对方)(?:本方户名|账户名称|户\s*名)[:： \t]*([\u4e00-\u9fffA-Za-z0-9（）()·]{2,})",
     ]:
         match = re.search(pattern, text)
@@ -319,7 +319,7 @@ def extract_statement_info(text: str, filename: str = "") -> dict:
     info = {"filename": filename}
     patterns = {
         "户名": r"(?:客户姓名|(?<!对方)户\s*名|(?<!对方)账户名称|客户名称)[:： \t]*([\u4e00-\u9fffA-Za-z0-9（）()·]{2,30})",
-        "账号": r"(?:卡\s*号|账\s*号|账户号码|账户)[:： \t]*([0-9* ]{6,})",
+        "账号": r"(?:卡\s*号|账\s*号|账户号码|账户)[:： \t]*([0-9* -]{6,})",
         "币种": r"币\s*种[:：]\s*([\u4e00-\u9fffA-Za-z]{2,10})",
         "起止日期": r"起止日期[:：\s]*([0-9]{4}[-/.]?[0-9]{1,2}[-/.]?[0-9]{1,2}\s*(?:至|到|一|-|—|~|～)+\s*[0-9]{4}[-/.]?[0-9]{1,2}[-/.]?[0-9]{1,2})",
         "电子流水号": r"电子流水号[:：\s]*([A-Za-z0-9-]{8,})",
@@ -752,6 +752,15 @@ def is_abc_account_detail_statement(text: str, filename: str = "") -> bool:
     return bool(
         "账户明细" in content
         and "交易时间 收入金额 支出金额 账户余额 对方账号 对方户名 交易用途 对方开户行 摘要" in content
+    )
+
+
+def is_abc_public_account_detail_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "账户明细" in content
+        and "交易时间 收入金额 支出金额 账户余额 交易用途 会计日期" in content
+        and re.search(r"交易时间\s*\|\s*收入金额\s*\|\s*支出金额\s*\|\s*账户余额\s*\|\s*交易用途\s*\|\s*会计日期", text)
     )
 
 
@@ -1437,6 +1446,37 @@ def parse_bank_pipe_table_line(line: str, account: str, source: str) -> dict | N
     header_text = "".join(cells[:5])
     if re.search(r"交易时\s*间|交易时间|交易日期|会计日期|交易金额|流水号收入|借方发生额|贷方发生额", header_text):
         return None
+
+    # 农业银行公户账户明细：交易时间 | 收入金额 | 支出金额 | 账户余额 | 交易用途 | 会计日期。
+    # PDF 同时含有逐字段文本和表格文本；表格文本最稳定，按列直接解析，避免通用规则漏识别。
+    if (
+        len(cells) >= 6
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", cells[0])
+        and re.fullmatch(r"20\d{6}", cells[5])
+        and (not cells[1] or money_to_float(cells[1]) is not None)
+        and (not cells[2] or money_to_float(cells[2]) is not None)
+        and money_to_float(cells[3]) is not None
+    ):
+        income = money_to_float(cells[1])
+        expense = money_to_float(cells[2])
+        balance = money_to_float(cells[3])
+        if not income and not expense:
+            return None
+        purpose = normalize_text(cells[4]).strip(".。")
+        counterparty = purpose if purpose and not re.fullmatch(r"[.。]+", purpose) else "农业银行账户明细"
+        return make_txn(
+            date=parse_date(cells[0]),
+            account=account,
+            counterparty=clean_counterparty_text(counterparty),
+            summary=purpose,
+            income=income,
+            expense=expense,
+            amount=None,
+            balance=balance,
+            source=source,
+            raw_key=line,
+            preserve_signed_columns=True,
+        )
 
     # 邮储银行历史明细：交易时间 | 子账号 | 储种 | 币种 | 钞汇 | 交易金额 | 交易余额 | 对方户名 | 对方账号 | 摘要 | 交易渠道 | 外部系统流水。
     # 这类表格外形接近工行个人借记卡历史明细；必须先于工行规则判断，
@@ -2415,6 +2455,9 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                 should_cancel=should_cancel,
             )
             source_mode = "PDF文字层-农行账户明细"
+        elif is_abc_public_account_detail_statement(text, path.name):
+            txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
+            source_mode = "PDF文字层-农行公户账户明细"
         else:
             txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
         text_length = len(text)
