@@ -755,6 +755,129 @@ def is_abc_account_detail_statement(text: str, filename: str = "") -> bool:
     )
 
 
+def is_huaxing_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "广东华兴银行客户账户交易明细表" in content
+        and "Transaction Statement of Guangdong Huaxing Bank" in content
+        and "交易日期 币种 收/支 交易金额 本次余额 对方账号 对方户名 摘要" in content
+    )
+
+
+HUAXING_TXN_RE = re.compile(
+    r"^(20\d{6})\s+人民币\s+([收支])\s+([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d{1,2})?)\s+"
+    r"((?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d{1,2})?)\s+([0-9A-Za-z*]{6,})\s+(.+)$"
+)
+
+
+def is_huaxing_noise_line(line: str) -> bool:
+    content = normalize_text(line)
+    return bool(
+        not content
+        or content.startswith("【第")
+        or re.search(
+            r"广东华兴银行客户账户交易明细表|Transaction Statement|客户名称[:：]|^Name$|账\s*号[:：]|"
+            r"Account Number|起始金额[:：]|From Amount|起始日期[:：]|Start Date|交易日期\s+币种|"
+            r"Date Currenc|第\s*\d+\s*页|共\s*\d+\s*页|打印时间[:：]|备注[:：]",
+            content,
+        )
+    )
+
+
+def split_huaxing_counterparty_summary(rest: str) -> tuple[str, str]:
+    text = normalize_text(rest)
+    markers = [
+        r"快捷支付[-—－][^\s]+",
+        r"超级网银[-—－]?[^\s]+",
+        r"手机银行[-—－]?[^\s]+",
+        r"网银转账",
+        r"转账",
+        r"冲正",
+        r"结息",
+        r"利息",
+    ]
+    match = re.search(r"\s+(" + "|".join(markers) + r")\s*$", text)
+    if match:
+        return clean_counterparty_text(text[: match.start()]), normalize_text(match.group(1))
+    return clean_counterparty_text(text), ""
+
+
+def extract_huaxing_statement_text(text: str, source: str, should_cancel=None) -> list[dict]:
+    """广东华兴银行客户账户交易明细表。
+
+    该 PDF 文字层清晰，但页眉里的起止日期会被通用规则误判成交易金额；
+    部分对方户名还会被换行拆成“有限/公司”。这里按华兴固定文本行解析。
+    """
+    account = infer_account_from_text(text, normalize_source_account(source))
+    txns: list[dict] = []
+    pending: dict | None = None
+
+    def flush_pending() -> None:
+        nonlocal pending
+        if not pending:
+            return
+        txn = make_txn(
+            date=pending["date"],
+            account=account,
+            counterparty=clean_counterparty_text(pending["counterparty"]),
+            summary=pending["summary"],
+            income=pending["income"],
+            expense=pending["expense"],
+            amount=None,
+            balance=pending["balance"],
+            source=source,
+            raw_key=pending["raw_key"],
+            preserve_signed_columns=True,
+        )
+        if txn:
+            txns.append(txn)
+        pending = None
+
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        if line_no % 50 == 0:
+            raise_if_cancelled(should_cancel)
+        line = normalize_text(raw)
+        match = HUAXING_TXN_RE.match(line)
+        if match:
+            flush_pending()
+            date_text, direction, amount_text, balance_text, counterparty_account, rest = match.groups()
+            amount = abs(money_to_float(amount_text) or 0)
+            balance = money_to_float(balance_text)
+            counterparty, summary = split_huaxing_counterparty_summary(rest)
+            summary_parts = [summary]
+            if counterparty_account:
+                summary_parts.append(f"对方账号:{counterparty_account}")
+            pending = {
+                "date": parse_date(date_text),
+                "counterparty": counterparty or counterparty_account or "未识别",
+                "summary": " ".join(part for part in summary_parts if part),
+                "income": amount if direction == "收" else None,
+                "expense": amount if direction == "支" else None,
+                "balance": balance,
+                "raw_key": line,
+            }
+            continue
+        if pending and line and not is_huaxing_noise_line(line):
+            # 对方户名跨行时，后续行通常只有“公司/限公司/运营中心”等文字。
+            if len(line) <= 40 and money_to_float(line) is None and not parse_date(line):
+                pending["counterparty"] = clean_counterparty_text(f"{pending['counterparty']}{line}")
+                pending["raw_key"] = f"{pending['raw_key']} {line}"
+            continue
+        if is_huaxing_noise_line(line):
+            continue
+        flush_pending()
+    flush_pending()
+    unique: list[dict] = []
+    seen_raw: set[str] = set()
+    for txn in txns:
+        raw_key = normalize_text(txn.get("raw_key"))
+        if raw_key in seen_raw:
+            continue
+        seen_raw.add(raw_key)
+        unique.append(txn)
+    return unique
+
+
 def join_pdf_words(words: list[dict], *, digits_only: bool = False) -> str:
     ordered = sorted(words, key=lambda w: (round(float(w.get("top", 0)) / 3), float(w.get("x0", 0))))
     text = " ".join(normalize_text(w.get("text", "")) for w in ordered if normalize_text(w.get("text", "")))
@@ -2275,7 +2398,10 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
             source_mode = "OCR识别"
         if progress:
             progress(88, "解析流水文本")
-        if is_corporate_query_statement(text, path.name):
+        if is_huaxing_statement(text, path.name):
+            txns = extract_huaxing_statement_text(text, path.name, should_cancel=should_cancel)
+            source_mode = "PDF文字层-华兴银行流水"
+        elif is_corporate_query_statement(text, path.name):
             txns, _ = extract_corporate_query_pdf(
                 path,
                 passwords=[used_password] if used_password else passwords,
