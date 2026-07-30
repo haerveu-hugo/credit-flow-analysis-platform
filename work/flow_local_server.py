@@ -182,6 +182,23 @@ def normalize_text(value) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def clean_table_cell_text(value) -> str:
+    text = normalize_text(value).replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"\s+([.。%，,])", r"\1", text)
+    text = re.sub(r"([（(])\s+", r"\1", text)
+    text = re.sub(r"\s+([）)])", r"\1", text)
+    return normalize_text(text)
+
+
+def normalize_broken_bank_datetime(value: str) -> str:
+    text = clean_table_cell_text(value)
+    text = re.sub(r"(20\d{2})[-/.](\d{1,2})[-/.]\s*(\d{1,2})", lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", text)
+    text = re.sub(r"(20\d{2})(\d{2})(\d{2})", r"\1-\2-\3", text)
+    return normalize_text(text)
+
+
 def parse_date(value, default_year: int | None = None) -> str | None:
     if value is None:
         return None
@@ -281,7 +298,7 @@ def infer_account_from_text(text: str, fallback: str = "") -> str:
         return f"{name}微信({suffix})"
     for pattern in [
         r"(?:本方账号|交易账号|账\s*号|账户(?:号码|账号|号)?|卡\s*号|户号)[:： \t]*([0-9* -]{6,})",
-        r"(?<!对方)(?:本方户名|账户名称|户\s*名)[:： \t]*([\u4e00-\u9fffA-Za-z0-9（）()·]{2,})",
+        r"(?:本方户名|账户名称|(?<!账)(?<!对方)户\s*名)[:： \t]*([\u4e00-\u9fffA-Za-z0-9（）()·]{2,})",
     ]:
         match = re.search(pattern, text)
         if match:
@@ -318,7 +335,7 @@ def extract_statement_info(text: str, filename: str = "") -> dict:
     content = normalize_text(text)
     info = {"filename": filename}
     patterns = {
-        "户名": r"(?:客户姓名|(?<!对方)户\s*名|(?<!对方)账户名称|客户名称)[:： \t]*([\u4e00-\u9fffA-Za-z0-9（）()·]{2,30})",
+        "户名": r"(?:客户姓名|(?<!账)(?<!对方)户\s*名|(?<!对方)账户名称|客户名称)[:： \t]*([\u4e00-\u9fffA-Za-z0-9（）()·]{2,30})",
         "账号": r"(?:卡\s*号|账\s*号|账户号码|账户)[:： \t]*([0-9* -]{6,})",
         "币种": r"币\s*种[:：]\s*([\u4e00-\u9fffA-Za-z]{2,10})",
         "起止日期": r"起止日期[:：\s]*([0-9]{4}[-/.]?[0-9]{1,2}[-/.]?[0-9]{1,2}\s*(?:至|到|一|-|—|~|～)+\s*[0-9]{4}[-/.]?[0-9]{1,2}[-/.]?[0-9]{1,2})",
@@ -331,6 +348,15 @@ def extract_statement_info(text: str, filename: str = "") -> dict:
     company_match = re.search(r"用户所属公司[:：]\s*(.+?)(?:\s+打印时间[:：]|$)", content)
     if company_match:
         info["户名"] = normalize_text(company_match.group(1))
+    shanghai_account = re.search(r"选择账号[:：\s]*([0-9* -]{6,})", content)
+    if shanghai_account:
+        info["账号"] = normalize_account(shanghai_account.group(1), info.get("账号", ""))
+    shanghai_name = re.search(r"选择账号[:：\s]*[0-9* -]{6,}\s+(.+?)\s+借方总笔数", content)
+    if shanghai_name:
+        info["户名"] = clean_table_cell_text(shanghai_name.group(1))
+    shanghai_bank = re.search(r"开户行[:：\s]*([\u4e00-\u9fffA-Za-z0-9（）()·\s]{2,40})\s+币种", content)
+    if shanghai_bank:
+        info["开户行"] = clean_table_cell_text(shanghai_bank.group(1))
     filename_account = infer_account_from_filename(filename)
     if filename_account:
         info["账号"] = filename_account
@@ -773,6 +799,57 @@ def is_huaxing_statement(text: str, filename: str = "") -> bool:
     )
 
 
+def is_shanghai_bank_detail_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "账户明细查询" in content
+        and "上海银行" in content
+        and "交易流水号 交易时间 记账日期 交易方向 借方发生额 贷方发生额 余额 对手账号 对手名称" in content
+    )
+
+
+def is_shunde_rcb_public_detail_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "广东顺德农村商业银行股份有限公司" in content
+        and "账户/卡 明细信息" in content
+        and "账号/卡号" in content
+        and "交易日" in content
+        and "交易后" in content
+    )
+
+
+def extract_pdf_quick_text(
+    path: Path,
+    passwords: list[str] | None = None,
+    max_pages: int = 1,
+    should_cancel=None,
+) -> tuple[str, str]:
+    raise_if_cancelled(should_cancel)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    passwords = passwords or [""]
+    last_error = ""
+    for password in passwords:
+        chunks = []
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                for i, page in enumerate(pdf.pages[:max_pages], start=1):
+                    raise_if_cancelled(should_cancel)
+                    chunks.append(page.extract_text(x_tolerance=1, y_tolerance=3) or "")
+            return "\n".join(chunks), password
+        except Exception as exc:
+            last_error = str(exc)
+            error_text = f"{type(exc).__name__}: {last_error}"
+            if (not password and len(passwords) > 1) or re.search(r"password|encrypted|加密|密码|PdfminerException", error_text, re.I):
+                continue
+            if not re.search(r"password|encrypted|加密|密码", error_text, re.I):
+                return "", password
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
 HUAXING_TXN_RE = re.compile(
     r"^(20\d{6})\s+人民币\s+([收支])\s+([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d{1,2})?)\s+"
     r"((?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d{1,2})?)\s+([0-9A-Za-z*]{6,})\s+(.+)$"
@@ -885,6 +962,171 @@ def extract_huaxing_statement_text(text: str, source: str, should_cancel=None) -
         seen_raw.add(raw_key)
         unique.append(txn)
     return unique
+
+
+def parse_shanghai_bank_table_row(cells: list[str], fallback_account: str, source: str) -> dict | None:
+    if len(cells) < 18:
+        return None
+    cells = [clean_table_cell_text(cell) for cell in cells]
+    trade_time = cells[1]
+    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", trade_time):
+        return None
+    income = money_to_float(cells[5])
+    expense = money_to_float(cells[4])
+    balance = money_to_float(cells[6])
+    direction = normalize_text(cells[3])
+    if "入账" in direction or "贷方" in direction:
+        expense = None
+    elif "出账" in direction or "借方" in direction:
+        income = None
+    if not income and not expense:
+        return None
+    account = normalize_account(cells[16], fallback_account)
+    counterparty_account = re.sub(r"\s+", "", cells[7])
+    counterparty = clean_counterparty_text(cells[8] or counterparty_account or cells[13] or "未识别")
+    summary = " ".join(
+        part
+        for part in [
+            cells[9],
+            cells[10],
+            cells[11],
+            f"对方账号:{counterparty_account}" if counterparty_account else "",
+            cells[13],
+        ]
+        if part
+    )
+    return make_txn(
+        date=parse_date(trade_time),
+        account=account,
+        counterparty=counterparty,
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key=" | ".join(cells),
+        preserve_signed_columns=True,
+    )
+
+
+def extract_shanghai_bank_detail_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+    progress=None,
+) -> tuple[list[dict], str, str]:
+    passwords = passwords or [""]
+    last_error = ""
+    for password in passwords:
+        txns: list[dict] = []
+        quick_text = ""
+        account_name = ""
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                page_count = len(pdf.pages)
+                if pdf.pages:
+                    quick_text = pdf.pages[0].extract_text(x_tolerance=1, y_tolerance=3) or ""
+                account = infer_account_from_text(quick_text, infer_account_from_filename(path.name) or normalize_source_account(path.name))
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    if progress and (page_no == 1 or page_no % 10 == 0 or page_no == page_count):
+                        progress(12 + int(75 * page_no / max(page_count, 1)), f"读取上海银行表格 {page_no}/{page_count} 页")
+                    for table in page.extract_tables() or []:
+                        for row in table:
+                            cells = [clean_table_cell_text(cell) for cell in row or []]
+                            if not account_name and len(cells) > 15 and cells[15] and "交易账户名" not in cells[15]:
+                                account_name = cells[15]
+                            txn = parse_shanghai_bank_table_row(cells, account, path.name)
+                            if txn:
+                                txns.append(txn)
+            if account_name and "户名" not in quick_text:
+                quick_text = f"{quick_text}\n户名：{account_name}"
+            return dedupe_transactions(txns), password, quick_text
+        except Exception as exc:
+            last_error = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+                raise
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def parse_shunde_rcb_public_table_row(cells: list[str], account: str, source: str) -> dict | None:
+    if len(cells) < 12:
+        return None
+    cells = [clean_table_cell_text(cell) for cell in cells]
+    trade_time = normalize_broken_bank_datetime(cells[11])
+    date = parse_date(trade_time) or parse_date(normalize_broken_bank_datetime(cells[0]))
+    income = money_to_float(cells[2])
+    expense = money_to_float(cells[3])
+    balance = money_to_float(cells[7])
+    if not date or (not income and not expense):
+        return None
+    counterparty_account = re.sub(r"\s+", "", cells[4])
+    counterparty = clean_counterparty_text(cells[5] or counterparty_account or cells[6] or "未识别")
+    summary = " ".join(
+        part
+        for part in [
+            cells[1],
+            cells[8],
+            cells[9],
+            cells[10],
+            cells[6],
+            f"对方账号:{counterparty_account}" if counterparty_account else "",
+        ]
+        if part
+    )
+    return make_txn(
+        date=date,
+        account=account,
+        counterparty=counterparty,
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key=" | ".join(cells),
+        preserve_signed_columns=True,
+    )
+
+
+def extract_shunde_rcb_public_detail_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+    progress=None,
+) -> tuple[list[dict], str, str]:
+    passwords = passwords or [""]
+    last_error = ""
+    for password in passwords:
+        txns: list[dict] = []
+        quick_text = ""
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                page_count = len(pdf.pages)
+                if pdf.pages:
+                    quick_text = pdf.pages[0].extract_text(x_tolerance=1, y_tolerance=3) or ""
+                account = infer_account_from_text(quick_text, infer_account_from_filename(path.name) or normalize_source_account(path.name))
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    if progress and (page_no == 1 or page_no % 10 == 0 or page_no == page_count):
+                        progress(12 + int(75 * page_no / max(page_count, 1)), f"读取顺德农商表格 {page_no}/{page_count} 页")
+                    for table in page.extract_tables() or []:
+                        for row in table:
+                            cells = [clean_table_cell_text(cell) for cell in row or []]
+                            txn = parse_shunde_rcb_public_table_row(cells, account, path.name)
+                            if txn:
+                                txns.append(txn)
+            return dedupe_transactions(txns), password, quick_text
+        except Exception as exc:
+            last_error = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+                raise
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
 
 
 def join_pdf_words(words: list[dict], *, digits_only: bool = False) -> str:
@@ -2425,41 +2667,63 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
     elif suffix in PDF_EXTS:
         if progress:
             progress(10, "检查 PDF 文字层")
-        text, used_password = extract_pdf_text(path, passwords=passwords, should_cancel=should_cancel, progress=progress)
-        source_mode = "PDF文字层"
-        if len(text.strip()) < 120:
-            text = ocr_file(
+        quick_text, quick_password = extract_pdf_quick_text(path, passwords=passwords, should_cancel=should_cancel)
+        if is_shanghai_bank_detail_statement(quick_text, path.name):
+            if progress:
+                progress(12, "解析上海银行表格流水")
+            txns, used_password, text = extract_shanghai_bank_detail_pdf(
                 path,
-                job_dir,
+                passwords=[quick_password] if quick_password else passwords,
+                should_cancel=should_cancel,
                 progress=progress,
-                passwords=[used_password] if used_password else passwords,
-                should_cancel=should_cancel,
             )
-            source_mode = "OCR识别"
-        if progress:
-            progress(88, "解析流水文本")
-        if is_huaxing_statement(text, path.name):
-            txns = extract_huaxing_statement_text(text, path.name, should_cancel=should_cancel)
-            source_mode = "PDF文字层-华兴银行流水"
-        elif is_corporate_query_statement(text, path.name):
-            txns, _ = extract_corporate_query_pdf(
+            source_mode = "PDF表格-上海银行账户明细"
+        elif is_shunde_rcb_public_detail_statement(quick_text, path.name):
+            if progress:
+                progress(12, "解析顺德农商表格流水")
+            txns, used_password, text = extract_shunde_rcb_public_detail_pdf(
                 path,
-                passwords=[used_password] if used_password else passwords,
+                passwords=[quick_password] if quick_password else passwords,
                 should_cancel=should_cancel,
+                progress=progress,
             )
-            source_mode = "PDF文字层-企业交易查询"
-        elif is_abc_account_detail_statement(text, path.name):
-            txns, _ = extract_abc_account_detail_pdf(
-                path,
-                passwords=[used_password] if used_password else passwords,
-                should_cancel=should_cancel,
-            )
-            source_mode = "PDF文字层-农行账户明细"
-        elif is_abc_public_account_detail_statement(text, path.name):
-            txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
-            source_mode = "PDF文字层-农行公户账户明细"
+            source_mode = "PDF表格-顺德农商公户明细"
         else:
-            txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
+            text, used_password = extract_pdf_text(path, passwords=passwords, should_cancel=should_cancel, progress=progress)
+            source_mode = "PDF文字层"
+            if len(text.strip()) < 120:
+                text = ocr_file(
+                    path,
+                    job_dir,
+                    progress=progress,
+                    passwords=[used_password] if used_password else passwords,
+                    should_cancel=should_cancel,
+                )
+                source_mode = "OCR识别"
+            if progress:
+                progress(88, "解析流水文本")
+            if is_huaxing_statement(text, path.name):
+                txns = extract_huaxing_statement_text(text, path.name, should_cancel=should_cancel)
+                source_mode = "PDF文字层-华兴银行流水"
+            elif is_corporate_query_statement(text, path.name):
+                txns, _ = extract_corporate_query_pdf(
+                    path,
+                    passwords=[used_password] if used_password else passwords,
+                    should_cancel=should_cancel,
+                )
+                source_mode = "PDF文字层-企业交易查询"
+            elif is_abc_account_detail_statement(text, path.name):
+                txns, _ = extract_abc_account_detail_pdf(
+                    path,
+                    passwords=[used_password] if used_password else passwords,
+                    should_cancel=should_cancel,
+                )
+                source_mode = "PDF文字层-农行账户明细"
+            elif is_abc_public_account_detail_statement(text, path.name):
+                txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
+                source_mode = "PDF文字层-农行公户账户明细"
+            else:
+                txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
         text_length = len(text)
         info = extract_statement_info(text, path.name)
         (job_dir / "extracted.txt").write_text(text, encoding="utf-8")
