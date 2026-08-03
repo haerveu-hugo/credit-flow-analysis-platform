@@ -26,6 +26,21 @@ DEFAULT_HUB_HTML = """<!doctype html>
     .url{margin-top:14px;color:#2d7d9a;font-size:13px;word-break:break-all}
     .footer{margin-top:18px;color:#66758a;font-size:13px}
     @media(max-width:760px){.grid{grid-template-columns:1fr}header,main{padding:18px}}
+    :root{--glass:rgba(255,255,255,.10);--glass2:rgba(255,255,255,.06);--neon:#70e7ff;--violet:#bd7cff;--text:#edf7ff;--muted:#a9bad2}
+    body{min-height:100vh;background:
+      radial-gradient(circle at 18% 12%,rgba(112,231,255,.36),transparent 30%),
+      radial-gradient(circle at 82% 18%,rgba(189,124,255,.30),transparent 30%),
+      linear-gradient(135deg,#0b1328,#15244a 58%,#080d1c);color:var(--text);overflow-x:hidden}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;background:
+      linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(255,255,255,.028) 1px,transparent 1px);background-size:42px 42px;mask-image:radial-gradient(circle at 50% 20%,#000,transparent 75%)}
+    header{margin:22px auto 0;max-width:1120px;border:1px solid rgba(255,255,255,.18);border-radius:28px;background:linear-gradient(135deg,rgba(255,255,255,.13),rgba(255,255,255,.055));backdrop-filter:blur(22px);box-shadow:0 28px 80px rgba(0,0,0,.25)}
+    header h1{font-size:30px;letter-spacing:.03em}header p,.footer,.card p{color:var(--muted)}
+    main{position:relative}
+    .notice{background:rgba(255,255,255,.08);border:1px solid rgba(112,231,255,.22);color:#dff8ff;border-radius:18px;backdrop-filter:blur(16px)}
+    .card{background:linear-gradient(145deg,var(--glass),var(--glass2));border:1px solid rgba(255,255,255,.18);border-radius:24px;color:var(--text);box-shadow:0 24px 70px rgba(0,0,0,.22);backdrop-filter:blur(20px);transition:.2s ease}
+    .card:hover{border-color:rgba(112,231,255,.58);transform:translateY(-4px);box-shadow:0 28px 88px rgba(42,188,255,.18)}
+    .card h2{font-size:23px}.url{color:#9cf2ff}
   </style>
 </head>
 <body>
