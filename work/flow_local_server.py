@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -508,7 +508,7 @@ def find_header_map(df: pd.DataFrame) -> tuple[int | None, dict[str, int]]:
                 mapping.setdefault("balance", idx)
                 score += 2
                 continue
-            if re.search(r"对方户名|对方单位|交易对手|对方名称|对方账号名称|收付款人|对手户名|对手名称", compact):
+            if re.search(r"交易对方|对方户名|对方单位|交易对手|对方名称|对方账号名称|收付款人|对手户名|对手名称", compact):
                 mapping["counterparty"] = idx
                 score += 4
                 continue
@@ -544,12 +544,60 @@ def find_header_map(df: pd.DataFrame) -> tuple[int | None, dict[str, int]]:
     return best_row, best_map
 
 
+def find_csv_table_start(lines: list[str]) -> int:
+    for idx, line in enumerate(lines[:300]):
+        compact = re.sub(r"\s+", "", normalize_text(line)).replace("，", ",")
+        looks_like_header = (
+            re.search(r"交易(?:时间|日期|日)[,;|\t]", compact)
+            and re.search(r"金额|收[/／]?支|收入|支出|余额|借方|贷方", compact)
+            and re.search(r"交易对方|对方|摘要|商品说明|交易分类|用途|备注", compact)
+        )
+        if looks_like_header:
+            return idx
+    return 0
+
+
+def read_csv_sheet(path: Path) -> pd.DataFrame:
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "gb18030", "gbk", "utf-16", "utf-8"):
+        try:
+            text = path.read_text(encoding=encoding)
+        except Exception as exc:
+            last_error = exc
+            continue
+        lines = text.splitlines()
+        start = find_csv_table_start(lines)
+        payload = "\n".join(lines[start:]).strip()
+        if not payload:
+            continue
+        header_line = lines[start] if start < len(lines) else ""
+        delimiter = "\t" if header_line.count("\t") > header_line.count(",") else ","
+        try:
+            df = pd.read_csv(
+                StringIO(payload),
+                header=None,
+                dtype=str,
+                sep=delimiter,
+                engine="python",
+                on_bad_lines="skip",
+                keep_default_na=False,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        if df.shape[1] > 1:
+            return df.fillna("")
+    if last_error:
+        raise last_error
+    raise ValueError("无法读取 CSV 文件。")
+
+
 def extract_excel(path: Path, progress=None, passwords: list[str] | None = None, should_cancel=None) -> list[dict]:
     raise_if_cancelled(should_cancel)
     suffix = path.suffix.lower()
     try:
         if suffix == ".csv":
-            sheets = {"CSV": pd.read_csv(path, header=None, dtype=str, encoding_errors="ignore")}
+            sheets = {"CSV": read_csv_sheet(path)}
         elif suffix == ".xls":
             try:
                 sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str, engine="xlrd")
@@ -643,6 +691,7 @@ def extract_excel(path: Path, progress=None, passwords: list[str] | None = None,
             idx for idx, cell in enumerate(header_cells)
             if re.search(r"摘要|用途|附言|备注|交易类型|业务摘要|说明", re.sub(r"\s+", "", cell))
         ]
+        status_col = next((idx for idx, cell in enumerate(header_cells) if re.search(r"交易状态|状态", re.sub(r"\s+", "", cell))), None)
         for row_idx in range(start, len(df)):
             if row_idx % 50 == 0:
                 raise_if_cancelled(should_cancel)
@@ -671,6 +720,9 @@ def extract_excel(path: Path, progress=None, passwords: list[str] | None = None,
                 summary = " ".join(row[idx] for idx in summary_cols if idx < len(row) and row[idx])
             else:
                 summary = row[mapping["summary"]] if "summary" in mapping and mapping["summary"] < len(row) else joined
+            status_text = row[status_col] if status_col is not None and status_col < len(row) else ""
+            if status_text and status_text not in summary:
+                summary = normalize_text(f"{summary} 状态:{status_text}")
             if signed_amount_column and amount is not None and "direction" not in mapping and income is None and expense is None:
                 if amount > 0:
                     income, expense = amount, None
@@ -716,6 +768,10 @@ def extract_excel(path: Path, progress=None, passwords: list[str] | None = None,
                 source=f"{path.name} / {sheet_name}",
             )
             if txn:
+                if "支付宝交易明细" in path.name and re.search(r"交易关闭|关闭|失败|已取消|取消", status_text):
+                    txn["category"] = "支付宝未完成/关闭订单"
+                    txn["default_excluded"] = True
+                    txn["exclude_reason"] = "支付宝未完成/关闭订单"
                 if is_wechat_internal:
                     txn["category"] = "微信内部流水"
                     txn["default_excluded"] = True
