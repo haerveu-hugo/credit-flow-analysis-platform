@@ -875,6 +875,17 @@ def is_shunde_rcb_public_detail_statement(text: str, filename: str = "") -> bool
     )
 
 
+def is_foshan_rcb_personal_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "佛山农村商业银行股份有限公司" in content
+        and "个人账户交易明细" in content
+        and "收入汇总" in content
+        and "支出汇总" in content
+        and "流水号 记账日期 交易日期 收入/支出 余额 对方账号 对方户名" in content
+    )
+
+
 def is_account_detail_query_result_statement(text: str, filename: str = "") -> bool:
     content = normalize_text(text)
     return bool(
@@ -1185,6 +1196,103 @@ def extract_shunde_rcb_public_detail_pdf(
                             if txn:
                                 txns.append(txn)
             return dedupe_transactions(txns), password, quick_text
+        except Exception as exc:
+            last_error = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+                raise
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def clean_foshan_rcb_noise(text: str) -> str:
+    text = clean_table_cell_text(text)
+    for pattern in [
+        r"司\s*公\s*限",
+        r"公\s*限",
+        r"有\s*份\s*股",
+        r"份\s*股",
+        r"业\s*银",
+        r"商\s*村",
+        r"农\s*山\s*佛",
+        r"(?<![\u4e00-\u9fff])司(?![\u4e00-\u9fff])",
+    ]:
+        text = re.sub(pattern, "", text)
+    return normalize_text(text)
+
+
+def parse_foshan_rcb_personal_table_row(cells: list[str], account: str, source: str) -> dict | None:
+    if len(cells) < 11:
+        return None
+    cells = [clean_table_cell_text(cell) for cell in cells]
+    if "流水号" in cells[0] or "收入/支出" in " ".join(cells[:5]):
+        return None
+    date = parse_date(cells[2]) or parse_date(cells[1])
+    amount = money_to_float(cells[3])
+    balance = money_to_float(cells[4])
+    if not date or amount is None or abs(float(amount)) < 0.01:
+        return None
+    counterparty_account = re.sub(r"\s+", "", cells[5])
+    counterparty = clean_counterparty_text(cells[6] or counterparty_account or "未识别")
+    summary_parts = [
+        clean_foshan_rcb_noise(cells[8]),
+        clean_foshan_rcb_noise(cells[9]),
+        clean_foshan_rcb_noise(cells[10]),
+        f"对方账号:{counterparty_account}" if counterparty_account else "",
+    ]
+    income = abs(amount) if amount > 0 else None
+    expense = abs(amount) if amount < 0 else None
+    return make_txn(
+        date=date,
+        account=account,
+        counterparty=counterparty,
+        summary=" ".join(part for part in summary_parts if part),
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key=" | ".join(cells),
+        preserve_signed_columns=True,
+    )
+
+
+def extract_foshan_rcb_personal_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+    progress=None,
+) -> tuple[list[dict], str, str]:
+    passwords = passwords or [""]
+    last_error = ""
+    for password in passwords:
+        txns: list[dict] = []
+        quick_text = ""
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                page_count = len(pdf.pages)
+                if pdf.pages:
+                    quick_text = pdf.pages[0].extract_text(x_tolerance=1, y_tolerance=3) or ""
+                account = infer_account_from_text(quick_text, infer_account_from_filename(path.name) or normalize_source_account(path.name))
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    if progress and (page_no == 1 or page_no % 10 == 0 or page_no == page_count):
+                        progress(12 + int(75 * page_no / max(page_count, 1)), f"读取佛山农商表格 {page_no}/{page_count} 页")
+                    for table in page.extract_tables() or []:
+                        if not table:
+                            continue
+                        header_text = " ".join(clean_table_cell_text(cell) for cell in (table[0] or []))
+                        if "收入/支出" not in header_text or "对方户名" not in header_text:
+                            continue
+                        for row in table[1:]:
+                            cells = [clean_table_cell_text(cell) for cell in row or []]
+                            txn = parse_foshan_rcb_personal_table_row(cells, account, path.name)
+                            if txn:
+                                txns.append(txn)
+            # 佛山农商个人流水的 PDF 表格层偶尔会在同一页打印同一流水号的重复行；
+            # 顶部“收入/支出汇总”也按打印明细口径计算。这里保留单文件内的打印行，
+            # 让统计合计与银行回单一致；多文件之间仍由 build_flow_response 统一去重。
+            return txns, password, quick_text
         except Exception as exc:
             last_error = str(exc)
             if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
@@ -2825,6 +2933,16 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                 progress=progress,
             )
             source_mode = "PDF表格-上海银行账户明细"
+        elif is_foshan_rcb_personal_statement(quick_text, path.name):
+            if progress:
+                progress(12, "解析佛山农商表格流水")
+            txns, used_password, text = extract_foshan_rcb_personal_pdf(
+                path,
+                passwords=[quick_password] if quick_password else passwords,
+                should_cancel=should_cancel,
+                progress=progress,
+            )
+            source_mode = "PDF表格-佛山农商个人流水"
         elif is_shunde_rcb_public_detail_statement(quick_text, path.name):
             if progress:
                 progress(12, "解析顺德农商表格流水")
