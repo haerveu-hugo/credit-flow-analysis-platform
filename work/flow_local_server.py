@@ -44,6 +44,7 @@ EXCEL_EXTS = {".xlsx", ".xls", ".csv"}
 PDF_EXTS = {".pdf"}
 DEFAULT_EXCLUDE_KEYWORDS = [
     "手续费",
+    "费用外收",
     "账户管理费",
     "短信费",
     "利息",
@@ -833,7 +834,9 @@ def is_abc_account_detail_statement(text: str, filename: str = "") -> bool:
     content = normalize_text(text)
     return bool(
         "账户明细" in content
-        and "交易时间 收入金额 支出金额 账户余额 对方账号 对方户名 交易用途 对方开户行 摘要" in content
+        and "交易时间 收入金额 支出金额 账户余额 对方账号 对方户名" in content
+        and "对方开户行" in content
+        and "摘要" in content
     )
 
 
@@ -1404,6 +1407,62 @@ def pdf_words_in_column(words: list[dict], left: float, right: float) -> list[di
     return selected
 
 
+def detect_pdf_column_ranges(words: list[dict], defaults: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
+    header_names = ["交易时间", "收入金额", "支出金额", "账户余额", "对方账号", "对方户名", "对方开户行", "摘要"]
+    centers: dict[str, float] = {}
+    for name in header_names:
+        matches = [word for word in words if normalize_text(word.get("text", "")) == name]
+        if matches:
+            word = matches[0]
+            centers[name] = (float(word.get("x0", 0)) + float(word.get("x1", 0))) / 2
+    if not all(name in centers for name in header_names):
+        return defaults
+    boundaries = {
+        "income_left": (centers["交易时间"] + centers["收入金额"]) / 2,
+        "income_expense": (centers["收入金额"] + centers["支出金额"]) / 2,
+        "expense_balance": (centers["支出金额"] + centers["账户余额"]) / 2,
+        "balance_account": (centers["账户余额"] + centers["对方账号"]) / 2,
+        "account_counterparty": (centers["对方账号"] + centers["对方户名"]) / 2,
+        "counterparty_bank": (centers["对方户名"] + centers["对方开户行"]) / 2,
+        "bank_summary": (centers["对方开户行"] + centers["摘要"]) / 2,
+    }
+    page_right = max(float(word.get("x1", 0)) for word in words) + 10 if words else defaults["summary"][1]
+    return {
+        "income": (boundaries["income_left"], boundaries["income_expense"]),
+        "expense": (boundaries["income_expense"], boundaries["expense_balance"]),
+        "balance": (boundaries["expense_balance"], boundaries["balance_account"]),
+        "counterparty_account": (boundaries["balance_account"], boundaries["account_counterparty"]),
+        "counterparty": (boundaries["account_counterparty"], boundaries["counterparty_bank"]),
+        "bank": (boundaries["counterparty_bank"], boundaries["bank_summary"]),
+        "summary": (boundaries["bank_summary"], page_right),
+    }
+
+
+def abc_account_detail_row_starts(words: list[dict]) -> list[tuple[float, str]]:
+    date_words = [word for word in words if float(word.get("x0", 999)) < 90 and 80 < float(word.get("top", 0)) < 390]
+    starts: list[tuple[float, str]] = []
+    for word in date_words:
+        text = normalize_text(word.get("text", ""))
+        top = float(word.get("top", 0))
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", text):
+            starts.append((top, text))
+        elif re.fullmatch(r"20\d{2}-\d{2}-", text):
+            day_words = [
+                candidate
+                for candidate in date_words
+                if 0 < float(candidate.get("top", 0)) - top < 16
+                and re.fullmatch(r"\d{1,2}", normalize_text(candidate.get("text", "")))
+            ]
+            if day_words:
+                starts.append((top, f"{text}{normalize_text(day_words[0].get('text', '')).zfill(2)}"))
+    result: list[tuple[float, str]] = []
+    for top, date_text in sorted(starts):
+        if result and abs(result[-1][0] - top) < 2:
+            continue
+        result.append((top, date_text))
+    return result
+
+
 def extract_corporate_query_pdf(
     path: Path,
     passwords: list[str] | None = None,
@@ -1508,19 +1567,23 @@ def extract_abc_account_detail_pdf(
                     if header_account:
                         account = normalize_account(header_account.group(1), account)
                     words = page.extract_words(x_tolerance=1, y_tolerance=3, use_text_flow=False) or []
-                    starts = [
-                        word
-                        for word in words
-                        if float(word.get("x0", 999)) < 82
-                        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", normalize_text(word.get("text", "")))
-                    ]
-                    starts.sort(key=lambda w: float(w.get("top", 0)))
-                    for idx, start in enumerate(starts):
-                        date_text = normalize_text(start.get("text", ""))
-                        start_top = float(start.get("top", 0))
-                        next_top = float(starts[idx + 1].get("top", page.height)) if idx + 1 < len(starts) else float(page.height)
-                        block_top = max(72.0, start_top - 10.0)
-                        block_bottom = max(block_top + 1.0, next_top - 8.0)
+                    column_ranges = detect_pdf_column_ranges(
+                        words,
+                        {
+                            "income": (82, 145),
+                            "expense": (145, 205),
+                            "balance": (205, 265),
+                            "counterparty_account": (265, 330),
+                            "counterparty": (330, 392),
+                            "bank": (392, 525),
+                            "summary": (525, 590),
+                        },
+                    )
+                    starts = abc_account_detail_row_starts(words)
+                    for idx, (start_top, date_text) in enumerate(starts):
+                        next_top = starts[idx + 1][0] if idx + 1 < len(starts) else float(page.height)
+                        block_top = max(72.0, start_top - 13.0)
+                        block_bottom = max(block_top + 1.0, next_top - 10.0)
                         block = [
                             word
                             for word in words
@@ -1533,17 +1596,17 @@ def extract_abc_account_detail_pdf(
                             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", normalize_text(word.get("text", "")))
                         ]
                         time_text = normalize_text(time_words[0].get("text", "")) if time_words else ""
-                        income = money_to_float(join_pdf_words(pdf_words_in_column(block, 82, 145)))
-                        expense = money_to_float(join_pdf_words(pdf_words_in_column(block, 145, 205)))
-                        balance = money_to_float(join_pdf_words(pdf_words_in_column(block, 205, 265)))
-                        counterparty_account = join_pdf_words(pdf_words_in_column(block, 265, 330))
-                        counterparty = clean_counterparty_text(join_pdf_words(pdf_words_in_column(block, 330, 392)))
-                        purpose = join_pdf_words(pdf_words_in_column(block, 392, 455))
-                        counterparty_bank = join_pdf_words(pdf_words_in_column(block, 455, 525))
-                        summary = join_pdf_words(pdf_words_in_column(block, 525, 590))
+                        income = money_to_float(join_pdf_words(pdf_words_in_column(block, *column_ranges["income"])))
+                        expense = money_to_float(join_pdf_words(pdf_words_in_column(block, *column_ranges["expense"])))
+                        balance = money_to_float(join_pdf_words(pdf_words_in_column(block, *column_ranges["balance"])))
+                        counterparty_account = join_pdf_words(pdf_words_in_column(block, *column_ranges["counterparty_account"]), digits_only=True)
+                        counterparty = clean_counterparty_text(join_pdf_words(pdf_words_in_column(block, *column_ranges["counterparty"])))
+                        counterparty = re.sub(r"^司(?=[\u4e00-\u9fff]{2,})", "", counterparty)
+                        counterparty_bank = join_pdf_words(pdf_words_in_column(block, *column_ranges["bank"]))
+                        summary = join_pdf_words(pdf_words_in_column(block, *column_ranges["summary"]))
                         if income is None and expense is None:
                             continue
-                        summary_parts = [purpose, summary, counterparty_bank]
+                        summary_parts = [summary, counterparty_bank]
                         if counterparty_account:
                             summary_parts.append(f"对方账号:{counterparty_account}")
                         if time_text:
@@ -1558,7 +1621,7 @@ def extract_abc_account_detail_pdf(
                             amount=None,
                             balance=balance,
                             source=path.name,
-                            raw_key=f"abc:{page_no}:{idx}:{date_text}:{time_text}:{income}:{expense}:{balance}:{counterparty_account}:{counterparty}:{purpose}:{summary}",
+                            raw_key=f"abc:{page_no}:{idx}:{date_text}:{time_text}:{income}:{expense}:{balance}:{counterparty_account}:{counterparty}:{counterparty_bank}:{summary}",
                             preserve_signed_columns=True,
                         )
                         if txn:
