@@ -24,6 +24,10 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = Path(os.environ.get("PLATFORM_RUNTIME", ROOT / "runtime" / "dependencies"))
 PYTHON = Path(os.environ.get("PYTHON_BIN", RUNTIME / "python" / "bin" / "python3"))
 POPPLER = Path(os.environ.get("POPPLER_BIN", RUNTIME / "bin"))
+if not (POPPLER / "pdftoppm").exists():
+    poppler_override = RUNTIME / "bin" / "override"
+    if (poppler_override / "pdftoppm").exists():
+        POPPLER = poppler_override
 UPLOADS = ROOT / "tmp" / "flow_uploads"
 RESULTS = ROOT / "tmp" / "flow_results"
 CACHE = ROOT / "tmp" / "flow_cache"
@@ -867,6 +871,41 @@ def is_shanghai_bank_detail_statement(text: str, filename: str = "") -> bool:
     )
 
 
+def is_beibu_gulf_bank_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "广西北部湾银行对账明细" in content
+        and "交易时间 交易流水 支出金额 收入金额 账户余额 对方账户 对方户名 对方开户行 用途/摘要" in content
+    )
+
+
+def is_ccb_personal_current_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    name = normalize_text(filename)
+    return bool(
+        "中国建设银行个人活期账户全部交易明细" in content
+        and "序号 摘要 交易日期 交易金额 账户余额" in content
+        and ("对方账号与户名" in content or "对方账号与户名" in name)
+    )
+
+
+def should_force_ocr_pdf_text(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    name = normalize_text(filename)
+    if len(content) < 120:
+        return True
+    if "纯图版" in name and not is_ccb_personal_current_statement(content, filename):
+        return True
+    if (
+        "中国建设银行个人活期账户全部交易明细" in content
+        and not re.search(r"(?m)^\s*\d{1,5}\s+.+?\s+20\d{6}\s+[+-]?\d", content)
+    ):
+        return True
+    if len(content) < 800 and not re.search(r"20\d{6}|20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", content):
+        return True
+    return False
+
+
 def is_shunde_rcb_public_detail_statement(text: str, filename: str = "") -> bool:
     content = normalize_text(text)
     return bool(
@@ -1206,6 +1245,167 @@ def extract_shunde_rcb_public_detail_pdf(
     if len(passwords) <= 1 and not passwords[0]:
         raise PasswordRequiredError(path.name)
     raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def parse_beibu_gulf_bank_table_row(cells: list[str], account: str, source: str) -> dict | None:
+    if len(cells) < 9:
+        return None
+    cells = [clean_table_cell_text(cell) for cell in cells]
+    if "交易时间" in cells[0] or not re.fullmatch(r"20\d{6}", re.sub(r"\D", "", cells[0] or "")):
+        return None
+    date = parse_date(cells[0])
+    expense_value = money_to_float(cells[2])
+    income_value = money_to_float(cells[3])
+    balance = money_to_float(cells[4])
+    income = expense = None
+    if income_value is not None and abs(income_value) >= 0.01:
+        if income_value >= 0:
+            income = abs(income_value)
+        else:
+            expense = abs(income_value)
+    if expense_value is not None and abs(expense_value) >= 0.01:
+        if expense_value >= 0:
+            expense = abs(expense_value)
+        else:
+            income = abs(expense_value)
+    if not date or (income is None and expense is None):
+        return None
+    counterparty_account = re.sub(r"\s+", "", cells[5])
+    counterparty = clean_counterparty_text(cells[6] or counterparty_account or cells[7] or "未识别")
+    summary = " ".join(
+        part
+        for part in [
+            cells[8],
+            cells[7],
+            f"对方账号:{counterparty_account}" if counterparty_account else "",
+            f"流水号:{cells[1]}" if cells[1] else "",
+        ]
+        if part
+    )
+    return make_txn(
+        date=date,
+        account=account,
+        counterparty=counterparty,
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key=" | ".join(cells),
+        preserve_signed_columns=True,
+    )
+
+
+def extract_beibu_gulf_bank_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+    progress=None,
+) -> tuple[list[dict], str, str]:
+    passwords = passwords or [""]
+    last_error = ""
+    for password in passwords:
+        txns: list[dict] = []
+        quick_text = ""
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                page_count = len(pdf.pages)
+                if pdf.pages:
+                    quick_text = pdf.pages[0].extract_text(x_tolerance=1, y_tolerance=3) or ""
+                account = infer_account_from_text(quick_text, infer_account_from_filename(path.name) or normalize_source_account(path.name))
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    if progress and (page_no == 1 or page_no % 10 == 0 or page_no == page_count):
+                        progress(12 + int(75 * page_no / max(page_count, 1)), f"读取北部湾银行表格 {page_no}/{page_count} 页")
+                    for table in page.extract_tables() or []:
+                        if not table:
+                            continue
+                        header_text = " ".join(clean_table_cell_text(cell) for cell in (table[0] or []))
+                        if "交易流水" not in header_text or "支出金额" not in header_text or "收入金额" not in header_text:
+                            continue
+                        for row in table[1:]:
+                            cells = [clean_table_cell_text(cell) for cell in row or []]
+                            txn = parse_beibu_gulf_bank_table_row(cells, account, path.name)
+                            if txn:
+                                txns.append(txn)
+            return dedupe_transactions(txns), password, quick_text
+        except Exception as exc:
+            last_error = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+                raise
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def parse_ccb_personal_current_text(text: str, account: str, source: str, should_cancel=None) -> list[dict]:
+    txns: list[dict] = []
+    row_pattern = re.compile(
+        r"^\s*(\d{1,5})\s+(.+?)\s+(20\d{6})\s+"
+        r"([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})\s+"
+        r"((?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})(?:\s+(.*))?\s*$"
+    )
+    seen_seq: set[int] = set()
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        if line_no % 80 == 0:
+            raise_if_cancelled(should_cancel)
+        line = normalize_text(raw)
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        seq = int(match.group(1))
+        if seq <= 0 or seq > 10000 or seq in seen_seq:
+            continue
+        date = parse_date(match.group(3))
+        amount = money_to_float(match.group(4))
+        balance = money_to_float(match.group(5))
+        if not date or amount is None:
+            continue
+        seen_seq.add(seq)
+        summary_label = normalize_text(match.group(2))
+        tail = normalize_text(match.group(6) or "")
+        place_summary = tail
+        counterparty_account = ""
+        counterparty = ""
+        tail_match = re.match(r"(.+?)\s+([0-9A-Za-z*]{4,}/.+)$", tail)
+        if tail_match:
+            place_summary = normalize_text(tail_match.group(1))
+            acct_name = normalize_text(tail_match.group(2))
+            counterparty_account, _, counterparty_name = acct_name.partition("/")
+            counterparty = clean_counterparty_text(counterparty_name or acct_name)
+        elif "/" in tail:
+            counterparty_account, _, counterparty_name = tail.rpartition("/")
+            counterparty = clean_counterparty_text(counterparty_name or counterparty_account)
+        elif tail:
+            counterparty = clean_counterparty_text(tail)
+        if not counterparty or counterparty == "未识别":
+            counterparty = "建设银行结息" if "利息" in summary_label else "未识别"
+        summary = " ".join(
+            part
+            for part in [
+                summary_label,
+                place_summary,
+                f"对方账号:{counterparty_account}" if counterparty_account else "",
+                f"序号:{seq}",
+            ]
+            if part
+        )
+        txn = make_txn(
+            date=date,
+            account=account,
+            counterparty=counterparty,
+            summary=summary,
+            income=amount if amount > 0 else None,
+            expense=abs(amount) if amount < 0 else None,
+            amount=amount,
+            balance=balance,
+            source=source,
+            raw_key=f"{seq}|建行活期明细|{line}",
+        )
+        if txn:
+            txns.append(txn)
+    return dedupe_transactions(txns)
 
 
 def clean_foshan_rcb_noise(text: str) -> str:
@@ -2822,6 +3022,8 @@ def extract_text_transactions(text: str, source: str, should_cancel=None) -> lis
     txns: list[dict] = []
     default_year = None
     account = infer_account_from_text(text, source)
+    if is_ccb_personal_current_statement(text, source):
+        return parse_ccb_personal_current_text(text, account, source, should_cancel=should_cancel)
     shunde_rcb_mode = "广东顺德农村商业银行" in text and "账户/卡明细信息" in text and "存入/支取" in text
     if shunde_rcb_mode:
         return dedupe_transactions(parse_shunde_rcb_personal_text(text, account, source))
@@ -2996,6 +3198,16 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                 progress=progress,
             )
             source_mode = "PDF表格-上海银行账户明细"
+        elif is_beibu_gulf_bank_statement(quick_text, path.name):
+            if progress:
+                progress(12, "解析北部湾银行表格流水")
+            txns, used_password, text = extract_beibu_gulf_bank_pdf(
+                path,
+                passwords=[quick_password] if quick_password else passwords,
+                should_cancel=should_cancel,
+                progress=progress,
+            )
+            source_mode = "PDF表格-广西北部湾银行对账明细"
         elif is_foshan_rcb_personal_statement(quick_text, path.name):
             if progress:
                 progress(12, "解析佛山农商表格流水")
@@ -3029,7 +3241,7 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
         else:
             text, used_password = extract_pdf_text(path, passwords=passwords, should_cancel=should_cancel, progress=progress)
             source_mode = "PDF文字层"
-            if len(text.strip()) < 120:
+            if should_force_ocr_pdf_text(text, path.name):
                 text = ocr_file(
                     path,
                     job_dir,
@@ -3043,6 +3255,9 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
             if is_huaxing_statement(text, path.name):
                 txns = extract_huaxing_statement_text(text, path.name, should_cancel=should_cancel)
                 source_mode = "PDF文字层-华兴银行流水"
+            elif is_ccb_personal_current_statement(text, path.name):
+                txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
+                source_mode = "OCR识别-建行个人活期明细" if source_mode == "OCR识别" else "PDF文字层-建行个人活期明细"
             elif is_corporate_query_statement(text, path.name):
                 txns, _ = extract_corporate_query_pdf(
                     path,

@@ -11,6 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 OCR_DEPS = ROOT / 'work' / 'ocr_deps'
 RUNTIME = Path(os.environ.get('PLATFORM_RUNTIME', ROOT / 'runtime' / 'dependencies'))
 POPPLER = Path(os.environ.get('POPPLER_BIN', RUNTIME / 'bin'))
+if not (POPPLER / 'pdftoppm').exists():
+    poppler_override = RUNTIME / 'bin' / 'override'
+    if (poppler_override / 'pdftoppm').exists():
+        POPPLER = poppler_override
 PYTHON = Path(os.environ.get('PYTHON_BIN', RUNTIME / 'python' / 'bin' / 'python3'))
 TMP = ROOT / 'tmp' / 'local_ocr'
 FONT_CACHE = ROOT / 'tmp' / 'fontconfig'
