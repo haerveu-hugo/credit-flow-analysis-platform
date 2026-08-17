@@ -1046,6 +1046,15 @@ def is_industrial_bank_statement(text: str, filename: str = "") -> bool:
     )
 
 
+def is_nanan_rcb_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "交易明细清单" in content
+        and "福建南安农村商业银行" in content
+        and "序号 交易日期 交易类型 收入/支出 交易金额 账户余额 对方账号 对方户名 摘要 用途" in content
+    )
+
+
 def is_shunde_rcb_public_detail_statement(text: str, filename: str = "") -> bool:
     content = normalize_text(text)
     return bool(
@@ -1725,6 +1734,86 @@ def extract_industrial_bank_pdf(
     if len(passwords) <= 1 and not passwords[0]:
         raise PasswordRequiredError(path.name)
     raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def parse_nanan_rcb_line(line: str, account: str, source: str) -> dict | None:
+    line = normalize_text(line)
+    row_match = re.match(
+        r"^\s*(\d{1,6})\s+(20\d{2}-\d{2}-\d{2})\s+(\S+)\s+(收入|支出)\s+"
+        r"([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})\s+"
+        r"((?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})(?:\s+(.*))?$",
+        line,
+    )
+    if not row_match:
+        return None
+    seq, date_raw, txn_type, direction, amount_raw, balance_raw, tail = row_match.groups()
+    amount = money_to_float(amount_raw)
+    balance = money_to_float(balance_raw)
+    date = parse_date(date_raw)
+    if not date or amount is None:
+        return None
+    tail = normalize_text(tail or "")
+    counterparty_account = ""
+    counterparty = ""
+    summary = ""
+    summary_starters = r"转入|支取|归还贷款|发放贷款|税款|利息|退汇|转账|转出"
+    if tail:
+        account_match = re.match(r"^([0-9A-Za-z*]{6,})\s*(.*)$", tail)
+        if account_match:
+            counterparty_account = account_match.group(1)
+            rest = normalize_text(account_match.group(2))
+            if re.match(rf"^(?:{summary_starters})(?:\s|$)", rest):
+                counterparty = counterparty_account
+                summary = rest
+            else:
+                rest_match = re.match(rf"^(.+?)\s+({summary_starters})(?:\s+(.*))?$", rest)
+                if rest_match:
+                    counterparty = clean_counterparty_text(rest_match.group(1))
+                    summary = " ".join(part for part in [rest_match.group(2), rest_match.group(3) or ""] if part)
+                else:
+                    counterparty = clean_counterparty_text(rest or counterparty_account)
+        else:
+            counterparty = "福建南安农村商业银行" if re.search(r"利息", tail) else clean_counterparty_text(tail)
+            summary = tail
+    if direction == "收入":
+        income, expense = amount, None
+    else:
+        income, expense = None, amount
+    summary = " ".join(
+        part
+        for part in [
+            txn_type,
+            summary,
+            f"对方账号:{counterparty_account}" if counterparty_account else "",
+            f"序号:{seq}",
+        ]
+        if part
+    )
+    return make_txn(
+        date=date,
+        account=account,
+        counterparty=counterparty or counterparty_account or "未识别",
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key=f"{seq}|南安农商交易明细|{line}",
+        preserve_signed_columns=True,
+    )
+
+
+def extract_nanan_rcb_text(text: str, source: str, should_cancel=None) -> list[dict]:
+    account = infer_account_from_text(text, normalize_source_account(source))
+    txns: list[dict] = []
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        if line_no % 80 == 0:
+            raise_if_cancelled(should_cancel)
+        txn = parse_nanan_rcb_line(raw, account, source)
+        if txn:
+            txns.append(txn)
+    return dedupe_transactions(txns)
 
 
 def clean_foshan_rcb_noise(text: str) -> str:
@@ -3345,6 +3434,8 @@ def extract_text_transactions(text: str, source: str, should_cancel=None) -> lis
     txns: list[dict] = []
     default_year = None
     account = infer_account_from_text(text, source)
+    if is_nanan_rcb_statement(text, source):
+        return extract_nanan_rcb_text(text, source, should_cancel=should_cancel)
     if is_ccb_personal_current_statement(text, source):
         return parse_ccb_personal_current_text(text, account, source, should_cancel=should_cancel)
     shunde_rcb_mode = "广东顺德农村商业银行" in text and "账户/卡明细信息" in text and "存入/支取" in text
@@ -3601,6 +3692,9 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                     progress=progress,
                 )
                 source_mode = "PDF表格-兴业银行交易明细"
+            elif is_nanan_rcb_statement(text, path.name):
+                txns = extract_nanan_rcb_text(text, path.name, should_cancel=should_cancel)
+                source_mode = "PDF文字层-南安农商交易明细"
             elif is_ccb_personal_current_statement(text, path.name):
                 txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
                 source_mode = "OCR识别-建行个人活期明细" if source_mode == "OCR识别" else "PDF文字层-建行个人活期明细"
