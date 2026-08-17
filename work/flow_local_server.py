@@ -154,6 +154,18 @@ def parse_passwords(raw) -> list[str]:
     return ["", *unique] if "" not in unique else unique
 
 
+def password_candidates_from_filename(filename: str) -> list[str]:
+    stem = Path(filename).stem
+    candidates: list[str] = []
+    for match in re.finditer(r"(?<!\d)(\d{4,8})(?!\d)", stem):
+        value = match.group(1)
+        if re.fullmatch(r"20\d{2}(?:\d{2,4})?", value):
+            continue
+        if value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
 def cache_key(path: Path, password: str | None = None) -> str:
     digest = hashlib.sha256()
     digest.update(FLOW_OCR_CACHE_VERSION.encode("utf-8"))
@@ -617,6 +629,85 @@ def read_csv_sheet(path: Path) -> pd.DataFrame:
     raise ValueError("无法读取 CSV 文件。")
 
 
+def header_column_map(header_cells: list[str]) -> dict[str, int]:
+    columns: dict[str, int] = {}
+    for idx, cell in enumerate(header_cells):
+        chinese = normalize_text(cell).split("[", 1)[0].strip()
+        compact = re.sub(r"\s+", "", chinese)
+        if compact:
+            columns.setdefault(compact, idx)
+    return columns
+
+
+def infer_boc_hisqry_account(df: pd.DataFrame, fallback: str = "") -> str:
+    for row_idx in range(min(len(df), 12)):
+        row = [normalize_text(v) for v in df.iloc[row_idx].tolist()]
+        if row and "查询账号" in row[0]:
+            for cell in row[1:4]:
+                account = normalize_account(cell, "")
+                if account and account != "未识别账户":
+                    return account
+    return fallback
+
+
+def boc_hisqry_columns(header_cells: list[str]) -> dict[str, int]:
+    col = header_column_map(header_cells)
+    required = ["交易类型", "付款人账号", "付款人名称", "收款人账号", "收款人名称", "交易日期", "交易金额", "交易后余额"]
+    if not all(name in col for name in required):
+        return {}
+    return col
+
+
+def parse_boc_hisqry_row(row: list[str], columns: dict[str, int], account: str, source: str) -> dict | None:
+    def cell(name: str) -> str:
+        idx = columns.get(name, -1)
+        return row[idx] if 0 <= idx < len(row) else ""
+
+    date = parse_date(cell("交易日期")) or parse_short_bank_date(cell("交易日期"))
+    amount = money_to_float(cell("交易金额"))
+    balance = money_to_float(cell("交易后余额"))
+    if not date or amount is None:
+        return None
+    if amount > 0:
+        counterparty = cell("付款人名称") or cell("付款人账号") or cell("付款人开户行名") or "未识别"
+        counterparty_account = cell("付款人账号")
+        counterparty_bank = cell("付款人开户行名")
+        income, expense = abs(amount), None
+    else:
+        counterparty = cell("收款人名称") or cell("收款人账号") or cell("收款人开户行名") or "未识别"
+        counterparty_account = cell("收款人账号")
+        counterparty_bank = cell("收款人开户行名")
+        income, expense = None, abs(amount)
+    summary = " ".join(
+        part
+        for part in [
+            cell("交易类型"),
+            cell("业务类型"),
+            cell("摘要"),
+            cell("用途"),
+            cell("交易附言"),
+            cell("备注"),
+            counterparty_bank,
+            f"对方账号:{counterparty_account}" if counterparty_account else "",
+            f"流水号:{cell('交易流水号')}" if cell("交易流水号") else "",
+        ]
+        if part
+    )
+    return make_txn(
+        date=date,
+        account=account,
+        counterparty=clean_counterparty_text(counterparty),
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key="中行HISQRY|" + " | ".join(row),
+        preserve_signed_columns=True,
+    )
+
+
 def extract_excel(path: Path, progress=None, passwords: list[str] | None = None, should_cancel=None) -> list[dict]:
     raise_if_cancelled(should_cancel)
     suffix = path.suffix.lower()
@@ -717,11 +808,19 @@ def extract_excel(path: Path, progress=None, passwords: list[str] | None = None,
             if re.search(r"摘要|用途|附言|备注|交易类型|业务摘要|说明", re.sub(r"\s+", "", cell))
         ]
         status_col = next((idx for idx, cell in enumerate(header_cells) if re.search(r"交易状态|状态", re.sub(r"\s+", "", cell))), None)
+        boc_columns = boc_hisqry_columns(header_cells)
+        if boc_columns:
+            sheet_account = infer_boc_hisqry_account(df, sheet_account)
         for row_idx in range(start, len(df)):
             if row_idx % 50 == 0:
                 raise_if_cancelled(should_cancel)
             row = [normalize_text(v) for v in df.iloc[row_idx].tolist()]
             if is_summary_row(row):
+                continue
+            if boc_columns:
+                txn = parse_boc_hisqry_row(row, boc_columns, sheet_account, f"{path.name} / {sheet_name}")
+                if txn:
+                    txns.append(txn)
                 continue
             joined = " ".join(row)
             if "date" in mapping:
@@ -926,6 +1025,25 @@ def should_force_ocr_pdf_text(text: str, filename: str = "") -> bool:
     if len(content) < 800 and not re.search(r"20\d{6}|20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", content):
         return True
     return False
+
+
+def is_huaxia_personal_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "华夏银行个人账户交易流水" in content
+        and "交易金额 余额 交易机构 对方姓名 对方卡/账号" in content
+    )
+
+
+def is_industrial_bank_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    name = normalize_text(filename)
+    return bool(
+        ("兴业银行交易明细" in content or "兴业" in name)
+        and ("交易金额 Transaction Amount" in content or "交易金额" in content)
+        and ("账户余额 Account Balance" in content or "账户余额" in content)
+        and ("对方账户/对方银行" in content or "对方银行" in content)
+    )
 
 
 def is_shunde_rcb_public_detail_statement(text: str, filename: str = "") -> bool:
@@ -1396,6 +1514,8 @@ def parse_ccb_personal_current_text(text: str, account: str, source: str, should
         if line_no % 80 == 0:
             raise_if_cancelled(should_cancel)
         line = normalize_text(raw)
+        if "|" in line or len(re.findall(r"20\d{2}-\d{2}-\d{2}", line)) > 1:
+            continue
         match = row_pattern.match(line)
         if not match:
             continue
@@ -1451,6 +1571,160 @@ def parse_ccb_personal_current_text(text: str, account: str, source: str, should
         if txn:
             txns.append(txn)
     return dedupe_transactions(txns)
+
+
+def extract_huaxia_personal_text(text: str, source: str, should_cancel=None) -> list[dict]:
+    account = infer_account_from_text(text, normalize_source_account(source))
+    txns: list[dict] = []
+    previous_balance = None
+    row_pattern = re.compile(
+        r"^(20\d{2}-\d{2}-\d{2})\s+(?:(.+?)\s+)?"
+        r"([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})\s+"
+        r"((?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})(?:\s+(.*))?$"
+    )
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        if line_no % 80 == 0:
+            raise_if_cancelled(should_cancel)
+        line = normalize_text(raw)
+        if "|" in line or len(re.findall(r"20\d{2}-\d{2}-\d{2}", line)) > 1:
+            continue
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        date = parse_date(match.group(1))
+        desc = normalize_text(match.group(2) or "")
+        amount = money_to_float(match.group(3))
+        balance = money_to_float(match.group(4))
+        rest = normalize_text(match.group(5) or "")
+        if not date or amount is None:
+            continue
+        income = expense = None
+        if previous_balance is not None and balance is not None:
+            delta = round(float(balance) - float(previous_balance), 2)
+            if abs(delta - abs(amount)) <= 0.05:
+                income = abs(amount)
+            elif abs(delta + abs(amount)) <= 0.05:
+                expense = abs(amount)
+        if income is None and expense is None:
+            if amount < 0:
+                expense = abs(amount)
+            else:
+                direction = detect_direction(f"{desc} {rest}", amount)
+                if direction == "支出":
+                    expense = abs(amount)
+                else:
+                    income = abs(amount)
+        counterparty = infer_counterparty([desc, rest])
+        summary = " ".join(part for part in [desc, rest] if part)
+        txn = make_txn(
+            date=date,
+            account=account,
+            counterparty=counterparty,
+            summary=summary,
+            income=income,
+            expense=expense,
+            amount=None,
+            balance=balance,
+            source=source,
+            raw_key=f"{line_no}|华夏个人流水|{line}",
+            preserve_signed_columns=True,
+        )
+        if txn:
+            txns.append(txn)
+        if balance is not None:
+            previous_balance = float(balance)
+    return dedupe_transactions(txns)
+
+
+def parse_industrial_bank_table_row(cells: list[str], account: str, source: str) -> dict | None:
+    cells = [clean_table_cell_text(cell) for cell in cells or []]
+    if len(cells) < 6:
+        return None
+    header_text = " ".join(cells)
+    if "交易时间" in header_text and "交易金额" in header_text:
+        return None
+    row_text = " | ".join(cells)
+    date = parse_date(noisy_datetime(cells[0]) or cells[0]) or parse_short_bank_date(cells[1] if len(cells) > 1 else "")
+    amount = noisy_signed_money(cells[4] if len(cells) > 4 else "")
+    balance = noisy_balance_money(cells[5] if len(cells) > 5 else "")
+    direction_text = cells[3] if len(cells) > 3 else ""
+    if not date or amount is None:
+        return None
+    direction = detect_direction(direction_text, amount)
+    if direction == "支出" or amount < 0:
+        income, expense = None, abs(amount)
+    else:
+        income, expense = abs(amount), None
+    counterparty_name = cells[7] if len(cells) > 7 else ""
+    counterparty_bank_account = cells[8] if len(cells) > 8 else ""
+    counterparty = clean_counterparty_text(counterparty_name or counterparty_bank_account or "兴业银行流水")
+    summary = " ".join(
+        part
+        for part in [
+            cells[2] if len(cells) > 2 else "",
+            cells[6] if len(cells) > 6 else "",
+            counterparty_bank_account,
+        ]
+        if part
+    )
+    return make_txn(
+        date=date,
+        account=account,
+        counterparty=counterparty,
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key=f"兴业表格|{row_text}",
+        preserve_signed_columns=True,
+    )
+
+
+def extract_industrial_bank_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+    progress=None,
+) -> tuple[list[dict], str, str]:
+    passwords = passwords or [""]
+    for password in passwords:
+        txns: list[dict] = []
+        quick_text = ""
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                page_count = len(pdf.pages)
+                if pdf.pages:
+                    quick_text = pdf.pages[0].extract_text(x_tolerance=1, y_tolerance=3) or ""
+                account = infer_account_from_text(quick_text, normalize_source_account(path.name))
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    if progress and (page_no == 1 or page_no % 10 == 0 or page_no == page_count):
+                        progress(12 + int(75 * page_no / max(page_count, 1)), f"读取兴业银行表格 {page_no}/{page_count} 页")
+                    page_text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                    if page_text:
+                        quick_text += "\n" + page_text
+                    for table in page.extract_tables() or []:
+                        if not table:
+                            continue
+                        header_text = " ".join(clean_table_cell_text(cell) for cell in (table[0] or []))
+                        if "Transaction Amount" not in header_text and "交易金额" not in header_text:
+                            continue
+                        for row in table[1:]:
+                            txn = parse_industrial_bank_table_row(row or [], account, path.name)
+                            if txn:
+                                txns.append(txn)
+            return dedupe_transactions(txns), password, quick_text
+        except Exception as exc:
+            error_text = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", error_text, re.I):
+                raise
+    if is_pdf_encrypted(path) is False:
+        return [], "", ""
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
 
 
 def clean_foshan_rcb_noise(text: str) -> str:
@@ -3221,6 +3495,8 @@ def extract_text_transactions(text: str, source: str, should_cancel=None) -> lis
 def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, should_cancel=None) -> dict:
     raise_if_cancelled(should_cancel)
     passwords = passwords or [""]
+    filename_passwords = password_candidates_from_filename(path.name) if path.suffix.lower() in PDF_EXTS else []
+    passwords = list(dict.fromkeys([*passwords, *filename_passwords]))
     suffix = path.suffix.lower()
     job_dir = RESULTS / path.stem
     if job_dir.exists():
@@ -3257,6 +3533,16 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                 progress=progress,
             )
             source_mode = "PDF表格-广西北部湾银行对账明细"
+        elif is_industrial_bank_statement(quick_text, path.name):
+            if progress:
+                progress(12, "解析兴业银行表格流水")
+            txns, used_password, text = extract_industrial_bank_pdf(
+                path,
+                passwords=[quick_password] if quick_password else passwords,
+                should_cancel=should_cancel,
+                progress=progress,
+            )
+            source_mode = "PDF表格-兴业银行交易明细"
         elif is_foshan_rcb_personal_statement(quick_text, path.name):
             if progress:
                 progress(12, "解析佛山农商表格流水")
@@ -3304,6 +3590,17 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
             if is_huaxing_statement(text, path.name):
                 txns = extract_huaxing_statement_text(text, path.name, should_cancel=should_cancel)
                 source_mode = "PDF文字层-华兴银行流水"
+            elif is_huaxia_personal_statement(text, path.name):
+                txns = extract_huaxia_personal_text(text, path.name, should_cancel=should_cancel)
+                source_mode = "PDF文字层-华夏银行个人流水"
+            elif is_industrial_bank_statement(text, path.name):
+                txns, _, text = extract_industrial_bank_pdf(
+                    path,
+                    passwords=[used_password] if used_password else passwords,
+                    should_cancel=should_cancel,
+                    progress=progress,
+                )
+                source_mode = "PDF表格-兴业银行交易明细"
             elif is_ccb_personal_current_statement(text, path.name):
                 txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
                 source_mode = "OCR识别-建行个人活期明细" if source_mode == "OCR识别" else "PDF文字层-建行个人活期明细"
