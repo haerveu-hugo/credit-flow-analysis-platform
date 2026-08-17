@@ -23,11 +23,31 @@ from urllib.parse import parse_qs, quote, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = Path(os.environ.get("PLATFORM_RUNTIME", ROOT / "runtime" / "dependencies"))
 PYTHON = Path(os.environ.get("PYTHON_BIN", RUNTIME / "python" / "bin" / "python3"))
-POPPLER = Path(os.environ.get("POPPLER_BIN", RUNTIME / "bin"))
-if not (POPPLER / "pdftoppm").exists():
-    poppler_override = RUNTIME / "bin" / "override"
-    if (poppler_override / "pdftoppm").exists():
-        POPPLER = poppler_override
+
+
+def find_poppler_bin() -> Path:
+    configured = Path(os.environ.get("POPPLER_BIN", RUNTIME / "bin"))
+    runtime_cache = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies"
+    candidates = [
+        configured,
+        configured / "override",
+        RUNTIME / "bin" / "override",
+        RUNTIME / "native" / "poppler" / "bin",
+        RUNTIME / "native" / "poppler" / "poppler" / "bin",
+        runtime_cache / "bin" / "override",
+        runtime_cache / "native" / "poppler" / "bin",
+        runtime_cache / "native" / "poppler" / "poppler" / "bin",
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+    ]
+    for candidate in candidates:
+        if (candidate / "pdftoppm").exists() and (candidate / "pdfinfo").exists():
+            return candidate
+    return configured
+
+
+POPPLER = find_poppler_bin()
 UPLOADS = ROOT / "tmp" / "flow_uploads"
 RESULTS = ROOT / "tmp" / "flow_results"
 CACHE = ROOT / "tmp" / "flow_cache"
@@ -817,6 +837,8 @@ def extract_pdf_text(path: Path, passwords: list[str] | None = None, should_canc
                 continue
             if not re.search(r"password|encrypted|加密|密码", error_text, re.I):
                 return "", password
+    if is_pdf_encrypted(path) is False:
+        return "", passwords[0] if passwords else ""
     if len(passwords) <= 1 and not passwords[0]:
         raise PasswordRequiredError(path.name)
     raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
@@ -963,9 +985,32 @@ def extract_pdf_quick_text(
                 continue
             if not re.search(r"password|encrypted|加密|密码", error_text, re.I):
                 return "", password
+    if is_pdf_encrypted(path) is False:
+        return "", passwords[0] if passwords else ""
     if len(passwords) <= 1 and not passwords[0]:
         raise PasswordRequiredError(path.name)
     raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def is_pdf_encrypted(path: Path) -> bool | None:
+    pdfinfo = POPPLER / "pdfinfo"
+    if not pdfinfo.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(pdfinfo), str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return None
+    output = f"{result.stdout}\n{result.stderr}"
+    match = re.search(r"Encrypted:\s*(yes|no)", output, re.I)
+    if not match:
+        return None
+    return match.group(1).lower() == "yes"
 
 
 HUAXING_TXN_RE = re.compile(
@@ -1883,6 +1928,10 @@ def ocr_file(path: Path, job_dir: Path, progress=None, passwords: list[str] | No
                 errors.append(str(exc))
                 rendered = []
         if not rendered:
+            if is_pdf_encrypted(path) is False:
+                details = "；".join(errors[-2:])
+                suffix = f" 详细原因：{details}" if details else ""
+                raise RuntimeError(f"{path.name} 未加密，不需要输入密码；但平台无法渲染 PDF 图片页。请检查文件是否完整或稍后重试。{suffix}")
             raise PasswordRequiredError(path.name, f"{path.name} 需要输入正确的 PDF 密码，或该 PDF 无法渲染。")
         images = []
         for page_no, image in enumerate(rendered, start=1):

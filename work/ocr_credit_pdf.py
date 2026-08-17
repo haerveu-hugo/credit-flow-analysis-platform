@@ -10,14 +10,34 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OCR_DEPS = ROOT / 'work' / 'ocr_deps'
 RUNTIME = Path(os.environ.get('PLATFORM_RUNTIME', ROOT / 'runtime' / 'dependencies'))
-POPPLER = Path(os.environ.get('POPPLER_BIN', RUNTIME / 'bin'))
-if not (POPPLER / 'pdftoppm').exists():
-    poppler_override = RUNTIME / 'bin' / 'override'
-    if (poppler_override / 'pdftoppm').exists():
-        POPPLER = poppler_override
 PYTHON = Path(os.environ.get('PYTHON_BIN', RUNTIME / 'python' / 'bin' / 'python3'))
 TMP = ROOT / 'tmp' / 'local_ocr'
 FONT_CACHE = ROOT / 'tmp' / 'fontconfig'
+
+
+def find_poppler_bin() -> Path:
+    configured = Path(os.environ.get('POPPLER_BIN', RUNTIME / 'bin'))
+    runtime_cache = Path.home() / '.cache' / 'codex-runtimes' / 'codex-primary-runtime' / 'dependencies'
+    candidates = [
+        configured,
+        configured / 'override',
+        RUNTIME / 'bin' / 'override',
+        RUNTIME / 'native' / 'poppler' / 'bin',
+        RUNTIME / 'native' / 'poppler' / 'poppler' / 'bin',
+        runtime_cache / 'bin' / 'override',
+        runtime_cache / 'native' / 'poppler' / 'bin',
+        runtime_cache / 'native' / 'poppler' / 'poppler' / 'bin',
+        Path('/opt/homebrew/bin'),
+        Path('/usr/local/bin'),
+        Path('/usr/bin'),
+    ]
+    for candidate in candidates:
+        if (candidate / 'pdftoppm').exists() and (candidate / 'pdfinfo').exists():
+            return candidate
+    return configured
+
+
+POPPLER = find_poppler_bin()
 
 sys.path.insert(0, str(OCR_DEPS))
 from PIL import Image, ImageOps, ImageEnhance, ImageChops, ImageFilter
