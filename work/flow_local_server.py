@@ -52,6 +52,7 @@ UPLOADS = ROOT / "tmp" / "flow_uploads"
 RESULTS = ROOT / "tmp" / "flow_results"
 CACHE = ROOT / "tmp" / "flow_cache"
 FLOW_OCR_CACHE_VERSION = "flow-ocr-v4-fullpage-progress"
+MAX_REASONABLE_OCR_AMOUNT = 100_000_000
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -1010,6 +1011,15 @@ def is_ccb_personal_current_statement(text: str, filename: str = "") -> bool:
     )
 
 
+def has_ccb_personal_current_rows(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?m)^\s*\d{1,5}\s+.+?\s+20\d{6}\s*[+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2}",
+            text,
+        )
+    )
+
+
 def should_force_ocr_pdf_text(text: str, filename: str = "") -> bool:
     content = normalize_text(text)
     name = normalize_text(filename)
@@ -1019,7 +1029,7 @@ def should_force_ocr_pdf_text(text: str, filename: str = "") -> bool:
         return True
     if (
         "中国建设银行个人活期账户全部交易明细" in content
-        and not re.search(r"(?m)^\s*\d{1,5}\s+.+?\s+20\d{6}\s+[+-]?\d", content)
+        and not has_ccb_personal_current_rows(text)
     ):
         return True
     if len(content) < 800 and not re.search(r"20\d{6}|20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", content):
@@ -1514,9 +1524,9 @@ def extract_beibu_gulf_bank_pdf(
 def parse_ccb_personal_current_text(text: str, account: str, source: str, should_cancel=None) -> list[dict]:
     txns: list[dict] = []
     row_pattern = re.compile(
-        r"^\s*(\d{1,5})\s+(.+?)\s+(20\d{6})\s+"
-        r"([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})\s+"
-        r"((?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})(?:\s+(.*))?\s*$"
+        r"^\s*(\d{1,5})\s+(.+?)\s+(20\d{6})\s*"
+        r"([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})\s*"
+        r"((?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})(?:\s*(.*))?\s*$"
     )
     seen_seq: set[int] = set()
     for line_no, raw in enumerate(text.splitlines(), start=1):
@@ -1577,6 +1587,86 @@ def parse_ccb_personal_current_text(text: str, account: str, source: str, should
             source=source,
             raw_key=f"{seq}|建行活期明细|{line}",
         )
+        if txn:
+            txns.append(txn)
+    return dedupe_transactions(txns)
+
+
+def is_abc_public_ocr_statement(text: str, filename: str = "") -> bool:
+    content = normalize_text(text)
+    return bool(
+        "中国农业银行对公交易明细清单" in content
+        and "交易金额" in content
+        and "本次余额" in content
+        and re.search(r"(?m)^20\d{6}\s+(?:转存|转取|费用外收|转账开户|利息)", text)
+    )
+
+
+def decimal_money_matches(text: str) -> list[re.Match]:
+    normalized = normalize_money_fragments(text)
+    pattern = re.compile(
+        r"(?<!\d)[+-]?\s*(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\s*\d{1,2}(?!\d)"
+    )
+    return list(pattern.finditer(normalized))
+
+
+def parse_abc_public_ocr_line(line: str, account: str, source: str) -> dict | None:
+    line = normalize_money_fragments(line)
+    match = re.match(r"^(20\d{6})\s+(\S+)\s+(.+)$", line)
+    if not match:
+        return None
+    date_raw, summary, rest = match.groups()
+    if summary not in {"转账开户", "转存", "转取", "费用外收", "费用内收", "利息", "结息", "冲正"}:
+        return None
+    money_matches = decimal_money_matches(rest)
+    if len(money_matches) < 2:
+        return None
+    amount = money_to_float(money_matches[0].group(0).replace(" ", ""))
+    balance = money_to_float(money_matches[1].group(0).replace(" ", ""))
+    if amount is None or balance is None or abs(float(amount)) < 0.01:
+        return None
+    if abs(float(amount)) > MAX_REASONABLE_OCR_AMOUNT:
+        return None
+    tail = normalize_text(rest[money_matches[1].end():])
+    counterparty_parts = [
+        part
+        for part in re.split(r"\s+", tail)
+        if part and not re.fullmatch(r"\d{4,}", part) and not re.fullmatch(r"[A-Z]{3,}", part)
+    ]
+    counterparty = clean_counterparty_text(" ".join(counterparty_parts[-3:]) or summary)
+    direction = detect_direction(summary, amount)
+    if summary in {"转取", "费用外收"}:
+        direction = "支出"
+    elif summary in {"转存", "利息", "结息"}:
+        direction = "收入"
+    if amount < 0 or direction == "支出":
+        income, expense = None, abs(float(amount))
+    else:
+        income, expense = abs(float(amount)), None
+    return make_txn(
+        date=parse_date(date_raw),
+        account=account,
+        counterparty=counterparty,
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=amount,
+        balance=balance,
+        source=source,
+        raw_key=f"农行公户OCR|{date_raw}|{summary}|{amount}|{balance}|{tail[:80]}",
+    )
+
+
+def extract_abc_public_ocr_text(text: str, source: str, should_cancel=None) -> list[dict]:
+    account = infer_account_from_text(text, normalize_source_account(source))
+    txns: list[dict] = []
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        if line_no % 80 == 0:
+            raise_if_cancelled(should_cancel)
+        line = normalize_text(raw)
+        if not re.match(r"^20\d{6}\s+", line):
+            continue
+        txn = parse_abc_public_ocr_line(line, account, source)
         if txn:
             txns.append(txn)
     return dedupe_transactions(txns)
@@ -2619,6 +2709,39 @@ def parse_bank_pipe_table_line(line: str, account: str, source: str) -> dict | N
     if re.search(r"交易时\s*间|交易时间|交易日期|会计日期|交易金额|流水号收入|借方发生额|贷方发生额", header_text):
         return None
 
+    # 工商银行账户明细清单：交易时间 | 本方账号 | 对方户名 | 对方账号 | 对方账户开户行 | 凭证号 | 借/贷 | 借方发生额 | 贷方发生额 | 摘要 | 用途 | 余额
+    # 该格式常见于工行公户电子流水。旧规则会把“本方账号”误当工行个人格式的账号列，
+    # 再把摘要列当余额，导致整份文件 0 笔或金额错位。
+    if (
+        len(cells) >= 12
+        and re.fullmatch(r"20\d{6}\s+\d{2}:\d{2}:\d{2}", cells[0])
+        and re.fullmatch(r"\d{12,}", cells[1])
+        and cells[6] in {"借", "贷", "收入", "支出"}
+        and ((cells[7] and money_to_float(cells[7]) is not None) or (cells[8] and money_to_float(cells[8]) is not None))
+    ):
+        expense = money_to_float(cells[7])
+        income = money_to_float(cells[8])
+        if cells[6] in {"借", "支出"}:
+            income = None
+        elif cells[6] in {"贷", "收入"}:
+            expense = None
+        balance = money_to_float(cells[11])
+        if not income and not expense:
+            return None
+        return make_txn(
+            date=parse_date(cells[0]),
+            account=normalize_account(cells[1], account),
+            counterparty=clean_counterparty_text(cells[2] or cells[3] or cells[4] or "工商银行"),
+            summary=" ".join(cell for cell in [cells[9], cells[10], f"对方账号:{cells[3]}" if cells[3] else ""] if cell),
+            income=income,
+            expense=expense,
+            amount=None,
+            balance=balance,
+            source=source,
+            raw_key=line,
+            preserve_signed_columns=True,
+        )
+
     # 农业银行公户账户明细：交易时间 | 收入金额 | 支出金额 | 账户余额 | 交易用途 | 会计日期。
     # PDF 同时含有逐字段文本和表格文本；表格文本最稳定，按列直接解析，避免通用规则漏识别。
     if (
@@ -3438,6 +3561,8 @@ def extract_text_transactions(text: str, source: str, should_cancel=None) -> lis
         return extract_nanan_rcb_text(text, source, should_cancel=should_cancel)
     if is_ccb_personal_current_statement(text, source):
         return parse_ccb_personal_current_text(text, account, source, should_cancel=should_cancel)
+    if is_abc_public_ocr_statement(text, source):
+        return extract_abc_public_ocr_text(text, source, should_cancel=should_cancel)
     shunde_rcb_mode = "广东顺德农村商业银行" in text and "账户/卡明细信息" in text and "存入/支取" in text
     if shunde_rcb_mode:
         return dedupe_transactions(parse_shunde_rcb_personal_text(text, account, source))
