@@ -1052,7 +1052,12 @@ def is_industrial_bank_statement(text: str, filename: str = "") -> bool:
         ("兴业银行交易明细" in content or "兴业" in name)
         and ("交易金额 Transaction Amount" in content or "交易金额" in content)
         and ("账户余额 Account Balance" in content or "账户余额" in content)
-        and ("对方账户/对方银行" in content or "对方银行" in content)
+        and (
+            "对方账户/对方银行" in content
+            or "对方银行" in content
+            or "Transaction Place" in content
+            or "交易地点" in content
+        )
     )
 
 
@@ -1781,6 +1786,99 @@ def parse_industrial_bank_table_row(cells: list[str], account: str, source: str)
     )
 
 
+def industrial_bank_statement_totals(text: str) -> tuple[int | None, float | None, int | None, float | None]:
+    match = re.search(
+        r"支出\s*¥?\s*([\d,，]+\.\d{2})\s*[（(]\s*(\d+)\s*[)）]\s*笔\s*收入\s*¥?\s*([\d,，]+\.\d{2})\s*[（(]\s*(\d+)\s*[)）]\s*笔",
+        text,
+    )
+    if not match:
+        return None, None, None, None
+    expense_total = money_to_float(match.group(1))
+    expense_count = int(match.group(2))
+    income_total = money_to_float(match.group(3))
+    income_count = int(match.group(4))
+    return income_count, income_total, expense_count, expense_total
+
+
+def extract_industrial_bank_pypdf_text(path: Path, password: str | None = None) -> str:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        if reader.is_encrypted:
+            reader.decrypt(password or "")
+        chunks = []
+        for page_no, page in enumerate(reader.pages, start=1):
+            chunks.append(f"【第 {page_no} 页】\n{page.extract_text() or ''}")
+        return "\n".join(chunks)
+    except Exception:
+        return ""
+
+
+def parse_industrial_bank_pypdf_text(text: str, account: str, source: str, should_cancel=None) -> list[dict]:
+    lines = [normalize_text(line) for line in text.splitlines() if normalize_text(line)]
+    txns: list[dict] = []
+    row_re = re.compile(
+        r"^(20\d{2}-\d{2}-\d{2})\s+"
+        r"(\d{2}:\d{2}:\d{2})\s+"
+        r"(20\d{6})\s+"
+        r"(.+?)\s+"
+        r"([支收])\s+"
+        r"([+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})\s+"
+        r"(\*+|(?:\d{1,3}(?:[,，]\d{3})+|\d+)\.\d{2})\s*"
+        r"(.*)$"
+    )
+    i = 0
+    while i < len(lines):
+        if i % 80 == 0:
+            raise_if_cancelled(should_cancel)
+        line = lines[i]
+        if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", line):
+            i += 1
+            continue
+        date_line = line
+        chunk = []
+        j = i + 1
+        while j < len(lines) and not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", lines[j]):
+            stop_line = lines[j]
+            if re.search(
+                r"第\s*\d+\s*页|交易时间|Transaction|兴业银行交易明细|说明[:：]|户\s*名|Account|Currency|打印日期|^20\d{2}年",
+                stop_line,
+            ):
+                break
+            chunk.append(stop_line)
+            j += 1
+        row_text = " ".join([date_line, *chunk])
+        match = row_re.match(row_text)
+        if match:
+            date_raw, time_raw, _book_date, summary_raw, direction_raw, amount_raw, balance_raw, place_raw = match.groups()
+            amount = money_to_float(amount_raw)
+            balance = None if "*" in balance_raw else money_to_float(balance_raw)
+            if amount is not None:
+                direction = "收入" if direction_raw == "收" else "支出"
+                summary = normalize_text(summary_raw)
+                place = normalize_text(place_raw)
+                txn = make_txn(
+                    date=parse_date(date_raw),
+                    account=account,
+                    counterparty=clean_counterparty_text(place or "兴业银行"),
+                    summary=" ".join(part for part in [summary, f"时间:{time_raw}", place] if part),
+                    income=abs(amount) if direction == "收入" else None,
+                    expense=abs(amount) if direction == "支出" else None,
+                    amount=None,
+                    balance=balance,
+                    source=source,
+                    raw_key=f"兴业PYPDF|{date_raw}|{time_raw}|{summary}|{direction_raw}|{amount_raw}|{place}",
+                    preserve_signed_columns=True,
+                )
+                if txn:
+                    txns.append(txn)
+            i = j
+            continue
+        i += 1
+    return dedupe_transactions(txns)
+
+
 def extract_industrial_bank_pdf(
     path: Path,
     passwords: list[str] | None = None,
@@ -1792,6 +1890,24 @@ def extract_industrial_bank_pdf(
         txns: list[dict] = []
         quick_text = ""
         try:
+            pypdf_text = extract_industrial_bank_pypdf_text(path, password=password)
+            if pypdf_text and is_industrial_bank_statement(pypdf_text, path.name):
+                account = infer_account_from_text(pypdf_text, normalize_source_account(path.name))
+                pypdf_txns = parse_industrial_bank_pypdf_text(pypdf_text, account, path.name, should_cancel=should_cancel)
+                income_count, income_total, expense_count, expense_total = industrial_bank_statement_totals(pypdf_text)
+                expected_count = (income_count or 0) + (expense_count or 0)
+                parsed_income = round(sum(txn["income"] for txn in pypdf_txns), 2)
+                parsed_expense = round(sum(txn["expense"] for txn in pypdf_txns), 2)
+                totals_match = (
+                    not expected_count
+                    or (
+                        len(pypdf_txns) == expected_count
+                        and (income_total is None or abs(parsed_income - float(income_total)) <= 0.05)
+                        and (expense_total is None or abs(parsed_expense - float(expense_total)) <= 0.05)
+                    )
+                )
+                if pypdf_txns and totals_match:
+                    return pypdf_txns, password, pypdf_text
             with pdfplumber.open(path, password=password or None) as pdf:
                 page_count = len(pdf.pages)
                 if pdf.pages:
@@ -3809,14 +3925,16 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
             elif is_huaxia_personal_statement(text, path.name):
                 txns = extract_huaxia_personal_text(text, path.name, should_cancel=should_cancel)
                 source_mode = "PDF文字层-华夏银行个人流水"
-            elif is_industrial_bank_statement(text, path.name):
+            elif is_industrial_bank_statement(text, path.name) or is_industrial_bank_statement(
+                extract_industrial_bank_pypdf_text(path, used_password), path.name
+            ):
                 txns, _, text = extract_industrial_bank_pdf(
                     path,
                     passwords=[used_password] if used_password else passwords,
                     should_cancel=should_cancel,
                     progress=progress,
                 )
-                source_mode = "PDF表格-兴业银行交易明细"
+                source_mode = "PDF文字层-兴业银行交易明细"
             elif is_nanan_rcb_statement(text, path.name):
                 txns = extract_nanan_rcb_text(text, path.name, should_cancel=should_cancel)
                 source_mode = "PDF文字层-南安农商交易明细"
