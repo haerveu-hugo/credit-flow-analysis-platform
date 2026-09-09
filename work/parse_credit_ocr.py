@@ -365,7 +365,16 @@ def add_summary_loan_supplements(summary: dict, loans: list[dict]) -> None:
 
 
 def account_blocks(lines, start_pat):
-    starts = [i for i, line in enumerate(lines) if re.search(start_pat, line)]
+    extra_starts = [
+        r'^[（(][一二三四五六七八九十]+[）)]\s*(?:非循环贷账户|循环贷账户|贷记卡账户|相关还款责任|授信协议|查询记录)',
+        r'^循环贷账户[一二三四五六七八九十]+$',
+        r'^管理机构\s+账户标识\s+开立日期\s+到期日期\s+(?:借款金额|账户授信额度)\s+账户币种$',
+    ]
+    starts = [
+        i
+        for i, line in enumerate(lines)
+        if re.search(start_pat, line) or any(re.search(pattern, line) for pattern in extra_starts)
+    ]
     for n, start in enumerate(starts):
         end = starts[n+1] if n+1 < len(starts) else len(lines)
         yield lines[start:end]
@@ -409,11 +418,25 @@ def extract_personal_lender(block: list[str]) -> str:
         return '重庆蚂蚁消费金融有限公司'
     if '佛山农村商业银行' in block_text:
         return '佛山农村商业银行股份有限公司'
+    if '建宁县农村信用' in block_text or '建宁县农村信' in block_text:
+        return '建宁县农村信用合作联社'
     if '重庆度小' in block_text:
         return '重庆度小满小额贷款有限公司'
     if '重庆携程' in block_text:
         return '重庆携程小额贷款有限公司'
     return lender or '未识别'
+
+
+def is_probable_identifier_amount(raw: str, value: float) -> bool:
+    text = (raw or '').strip().replace('，', ',')
+    digits = re.sub(r'\D', '', text)
+    if not digits:
+        return False
+    if text.startswith('0') and ',' not in text and len(digits) >= 6:
+        return True
+    if ',' not in text and len(digits) >= 8 and value >= 1_000_000:
+        return True
+    return False
 
 
 def parse_balance_fields(block: list[str]) -> tuple[float, str, float]:
@@ -580,20 +603,40 @@ def parse_loan_accounts(lines):
             '个人消费贷款' if '消费贷款' in text or '个人消费' in text else
             '其他贷款' if '其他贷款' in text else '贷款'
         )
-        guarantee = '信用/无担保' if '信用/无担保' in text or '你用/无担保' in text else ('组合' if '组合' in text else '')
+        if '组合' in text:
+            guarantee = '组合'
+        elif '信用/无担保' in text or '你用/无担保' in text:
+            guarantee = '信用/无担保'
+        elif '抵押' in text:
+            guarantee = '抵押'
+        elif '质押' in text:
+            guarantee = '质押'
+        elif '保证' in text:
+            guarantee = '保证'
+        else:
+            guarantee = ''
         limit = 0
         for i, line in enumerate(block):
             if re.search(r'账户.*(授信|授值|投信|板伯).*度|借款金额', line):
                 vals = []
                 for item in block[i+1:i+16]:
+                    raw_item = item.strip()
                     val = money(item)
-                    if val and val <= 5_000_000 and not re.match(r'20\d{2}', item):
+                    if (
+                        val
+                        and val <= 5_000_000
+                        and not re.match(r'20\d{2}', raw_item)
+                        and not is_probable_identifier_amount(raw_item, val)
+                    ):
                         vals.append(val)
                     if '人民币元' in item:
                         break
                 if vals:
-                    limit = vals[-1]
+                    limit = max(vals)
         balance, remaining, monthly = parse_balance_fields(block)
+        closed = '结清' in text or '结消' in text or '结沛' in text or '账户关闭日期' in text
+        if closed and not re.search(r'账户状态\s+五级分类\s+余额|正常\s+正常', text):
+            continue
         if balance > 0 or (limit and '正常' in text and '结清' not in text and '结消' not in text):
             overdue = parse_overdue_fields(block)
             loans.append({
@@ -606,12 +649,27 @@ def parse_loan_accounts(lines):
                 'monthly_payment': monthly,
                 **overdue,
             })
-    return loans
+    return dedupe_personal_loans(loans)
 
 
 def parse_inquiry_detail(lines, report_date):
     items = []
+    seen = set()
     in_detail = False
+
+    def query_institution(snippet: str) -> str:
+        text = clean(snippet)
+        text = re.sub(r'20\d{2}[.,:年-]\d{2}[.,月/-]\d{2}', ' ', text)
+        text = re.sub(r'(贷款审批|信用卡审批|贷款申批|信用卡申批|贷后管理|保前审查|担保资格审查|融资审批|法人代表.*?资信审查|实名审查|特约商户实名审查)', ' ', text)
+        candidates = re.findall(
+            r'[\u4e00-\u9fffA-Za-z（）()·]{2,}?(?:银行|公司|金融|担保|信用社|合作联社|农商行|信用卡中心|分行|支行|中心)[\u4e00-\u9fffA-Za-z（）()·]*',
+            text,
+        )
+        if candidates:
+            return normalize_org_name(candidates[-1])
+        fallback = re.sub(r'[\s\d.,:：、，()（）-]+', '', text)
+        return normalize_org_name(fallback[:40])
+
     for i, line in enumerate(lines):
         if '机构查询记录明细' in line or '查询记录' in line:
             in_detail = True
@@ -638,7 +696,12 @@ def parse_inquiry_detail(lines, report_date):
             reason = '贷款审批'
         if reason:
             date = re.sub(r'[.,:年月/]', '-', d).replace('日', '')
-            items.append({'date': date, 'reason': reason})
+            institution = query_institution(snippet)
+            key = (date, reason, institution)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({'date': date, 'reason': reason, 'institution': institution})
     return items
 
 
@@ -754,12 +817,39 @@ def lender_quality(name: str) -> int:
     return score
 
 
+def personal_loan_quality(item: dict) -> int:
+    score = lender_quality(item.get('lender') or '')
+    limit = float(item.get('limit') or 0)
+    balance = float(item.get('balance') or 0)
+    monthly = float(item.get('monthly_payment') or 0)
+    if limit and balance and limit >= balance:
+        score += 20
+    if limit and balance and limit < balance:
+        score -= 30
+    if monthly:
+        score += 5
+    if item.get('guarantee') not in {'', '未识别'}:
+        score += 8
+    if item.get('lender') == '未识别':
+        score -= 50
+    return score
+
+
 def dedupe_personal_loans(items: list[dict]) -> list[dict]:
     dedup: dict[tuple, dict] = {}
     for item in items:
-        key = (item.get('type') or '', round(float(item.get('limit') or 0), 2), round(float(item.get('balance') or 0), 2))
+        balance = round(float(item.get('balance') or 0), 2)
+        monthly = round(float(item.get('monthly_payment') or 0), 2)
+        remaining = str(item.get('remaining_terms') or '')
+        type_ = item.get('type') or ''
+        if balance > 0 and monthly > 0:
+            key = (type_, balance, monthly, remaining)
+        elif balance > 0:
+            key = (type_, balance, remaining)
+        else:
+            key = (type_, round(float(item.get('limit') or 0), 2), balance)
         old = dedup.get(key)
-        if not old or lender_quality(item.get('lender') or '') > lender_quality(old.get('lender') or ''):
+        if not old or personal_loan_quality(item) > personal_loan_quality(old):
             dedup[key] = item
     return list(dedup.values())
 
@@ -1568,6 +1658,7 @@ def parse(path):
             if key not in existing:
                 loans.append(item)
                 existing.add(key)
+    loans = dedupe_personal_loans(loans)
     add_summary_loan_supplements(summary, loans)
     inquiries_detail = parse_inquiry_detail(lines, summary['report_date'])
     return {
