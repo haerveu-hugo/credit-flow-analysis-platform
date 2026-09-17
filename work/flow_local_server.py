@@ -2920,7 +2920,12 @@ def parse_bank_pipe_table_line(line: str, account: str, source: str) -> dict | N
     if "|" not in line:
         return None
     cells = [normalize_text(cell) for cell in line.split("|")]
-    while cells and not cells[0]:
+    preserve_icbc_leading_empty = bool(
+        len(cells) >= 11
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", cells[4] or "")
+        and cells[5] in {"借", "贷", "收入", "支出"}
+    )
+    while cells and not cells[0] and not preserve_icbc_leading_empty:
         cells = cells[1:]
     while cells and not cells[-1]:
         cells = cells[:-1]
@@ -2929,6 +2934,52 @@ def parse_bank_pipe_table_line(line: str, account: str, source: str) -> dict | N
     header_text = "".join(cells[:5])
     if re.search(r"交易时\s*间|交易时间|交易日期|会计日期|交易金额|流水号收入|借方发生额|贷方发生额", header_text):
         return None
+
+    # 工行新版企业账户明细清单：对方账号 | 转入金额 | 转出金额 | 余额 |
+    # 交易时间 | 借贷标志 | 对方单位 | 用途 | 摘要 | 附言 | 入账日期。
+    # PDF 的普通文字层会把金额、账号和多行户名混在一起，必须使用其内嵌表格层。
+    if (
+        len(cells) >= 11
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", cells[4])
+        and cells[5] in {"借", "贷", "收入", "支出"}
+        and money_to_float(cells[3]) is not None
+        and (not cells[1] or money_to_float(cells[1]) is not None)
+        and (not cells[2] or money_to_float(cells[2]) is not None)
+    ):
+        income = money_to_float(cells[1])
+        expense = money_to_float(cells[2])
+        if cells[5] in {"借", "支出"}:
+            income = None
+        elif cells[5] in {"贷", "收入"}:
+            expense = None
+        if not income and not expense:
+            return None
+        counterparty_account = re.sub(r"\s+", "", cells[0])
+        counterparty = clean_counterparty_text(cells[6] or counterparty_account or "工商银行")
+        summary = " ".join(
+            part
+            for part in [
+                cells[7],
+                cells[8],
+                cells[9],
+                f"对方账号:{counterparty_account}" if counterparty_account else "",
+                cells[4],
+            ]
+            if part
+        )
+        return make_txn(
+            date=parse_date(cells[4]),
+            account=account,
+            counterparty=counterparty,
+            summary=summary,
+            income=income,
+            expense=expense,
+            amount=None,
+            balance=money_to_float(cells[3]),
+            source=source,
+            raw_key=line,
+            preserve_signed_columns=True,
+        )
 
     # 工商银行账户明细清单：交易时间 | 本方账号 | 对方户名 | 对方账号 | 对方账户开户行 | 凭证号 | 借/贷 | 借方发生额 | 贷方发生额 | 摘要 | 用途 | 余额
     # 该格式常见于工行公户电子流水。旧规则会把“本方账号”误当工行个人格式的账号列，
@@ -3807,6 +3858,7 @@ def extract_text_transactions(text: str, source: str, should_cancel=None) -> lis
     ) or bool(
         re.search(r"交易日期[^\n|]*\|[^\n]*(?:交易金额|Transaction Amount)", text)
         or re.search(r"(?m)^[^\n]*(?:交易日期|交易时间|交易流水)[^\n]*\|[^\n]*(?:交易金额|借方|贷方|余额)", text)
+        or re.search(r"对方账号\s*\|\s*转入金额\s*\|\s*转出金额\s*\|\s*余额\s*\|\s*交易时间", text)
     ) or alipay_mode
     # 中国银行导出的文本同时含有视觉文本和表格文本；只解析带竖线的表格行，
     # 避免同一笔交易被两套文本层重复计入。
@@ -4081,6 +4133,11 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                 source_mode = "PDF文字层-农行公户账户明细"
             else:
                 txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
+                if (
+                    "中国工商银行账户明细清单" in text
+                    and "对方账号 | 转入金额 | 转出金额 | 余额 | 交易时间 | 借贷标志" in text
+                ):
+                    source_mode = "PDF表格-工行企业账户明细"
         text_length = len(text)
         info = extract_statement_info(text, path.name)
         (job_dir / "extracted.txt").write_text(text, encoding="utf-8")
