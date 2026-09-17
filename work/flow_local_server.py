@@ -948,11 +948,12 @@ def is_corporate_query_statement(text: str, filename: str = "") -> bool:
     content = normalize_text(text)
     name = normalize_text(filename)
     return bool(
-        "交易查询" in name
+        ("交易查询" in name or ("用户所属公司" in content and "记录数" in content))
         and "交易日期" in content
         and "借方(出账)" in content
         and "贷方(入账)" in content
         and "收(付)方名称" in content
+        and "收(付)方账号" in content
     )
 
 
@@ -4067,7 +4068,7 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                     passwords=[used_password] if used_password else passwords,
                     should_cancel=should_cancel,
                 )
-                source_mode = "PDF文字层-企业交易查询"
+                source_mode = "PDF表格-招商银行企业流水" if "用户所属公司" in text else "PDF文字层-企业交易查询"
             elif is_abc_account_detail_statement(text, path.name):
                 txns, _ = extract_abc_account_detail_pdf(
                     path,
