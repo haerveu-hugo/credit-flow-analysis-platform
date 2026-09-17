@@ -1101,6 +1101,20 @@ def is_account_detail_query_result_statement(text: str, filename: str = "") -> b
     )
 
 
+def is_citic_corporate_account_statement(text: str, filename: str = "") -> bool:
+    """中信银行企业网银导出的横向九列账户交易明细。"""
+    content = normalize_text(text)
+    return bool(
+        "账户交易明细" in content
+        and "交易日期" in content
+        and "柜员交易号" in content
+        and "对方账户名称" in content
+        and "借方发生额" in content
+        and "贷方发生额" in content
+        and ("中信银行" in content or "中信银行" in normalize_text(filename))
+    )
+
+
 def extract_pdf_quick_text(
     path: Path,
     passwords: list[str] | None = None,
@@ -1313,6 +1327,96 @@ def parse_shanghai_bank_table_row(cells: list[str], fallback_account: str, sourc
         raw_key=" | ".join(cells),
         preserve_signed_columns=True,
     )
+
+
+def parse_citic_corporate_table_row(cells: list[str], account: str, source: str) -> dict | None:
+    if len(cells) < 9:
+        return None
+    cells = [clean_table_cell_text(cell) for cell in cells[:9]]
+    date = parse_date(cells[0])
+    if not date or "交易日期" in cells[0]:
+        return None
+    debit = money_to_float(cells[6])
+    credit = money_to_float(cells[7])
+    balance = money_to_float(cells[8])
+    income = expense = None
+    # 中信冲正行可能在原借/贷栏中显示负数：负借方等同入账，负贷方等同出账。
+    if debit is not None and abs(debit) >= 0.01:
+        if debit < 0:
+            income = abs(debit)
+        else:
+            expense = debit
+    if credit is not None and abs(credit) >= 0.01:
+        if credit < 0:
+            expense = abs(credit)
+        else:
+            income = credit
+    if income is None and expense is None:
+        return None
+    counterparty_account = re.sub(r"\s+", "", cells[3])
+    counterparty = clean_counterparty_text(cells[4] or counterparty_account or "中信银行")
+    summary = " ".join(
+        part
+        for part in [
+            cells[2],
+            cells[5],
+            f"对方账号:{counterparty_account}" if counterparty_account else "",
+            f"柜员交易号:{cells[1]}" if cells[1] else "",
+        ]
+        if part
+    )
+    return make_txn(
+        date=date,
+        account=account,
+        counterparty=counterparty,
+        summary=summary,
+        income=income,
+        expense=expense,
+        amount=None,
+        balance=balance,
+        source=source,
+        raw_key=" | ".join(cells),
+        preserve_signed_columns=True,
+    )
+
+
+def extract_citic_corporate_account_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+    progress=None,
+) -> tuple[list[dict], str, str]:
+    passwords = passwords or [""]
+    last_error = ""
+    for password in passwords:
+        txns: list[dict] = []
+        quick_text = ""
+        try:
+            with pdfplumber.open(path, password=password or None) as pdf:
+                page_count = len(pdf.pages)
+                if pdf.pages:
+                    quick_text = pdf.pages[0].extract_text(x_tolerance=1, y_tolerance=3) or ""
+                account = infer_account_from_text(
+                    quick_text,
+                    infer_account_from_filename(path.name) or normalize_source_account(path.name),
+                )
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    if progress and (page_no == 1 or page_no == page_count):
+                        progress(12 + int(75 * page_no / max(page_count, 1)), f"读取中信银行表格 {page_no}/{page_count} 页")
+                    for table in page.extract_tables() or []:
+                        for row in table:
+                            txn = parse_citic_corporate_table_row(row or [], account, path.name)
+                            if txn:
+                                txns.append(txn)
+            return dedupe_transactions(txns), password, quick_text
+        except Exception as exc:
+            last_error = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+                raise
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
 
 
 def extract_shanghai_bank_detail_pdf(
@@ -3625,6 +3729,12 @@ def transaction_fingerprint(txn: dict) -> tuple:
     event_time = re.sub(r"\D", "", time_match.group(1)) if time_match else ""
     first_cell = normalize_text(raw_key.split("|", 1)[0]) if "|" in raw_key else ""
     event_id = re.sub(r"\D", "", first_cell) if first_cell else ""
+    reference_match = re.search(r"(?:柜员交易号|交易流水号|流水号)[:：]\s*([A-Za-z0-9-]{8,})", raw_key)
+    event_reference = reference_match.group(1) if reference_match else ""
+    if not event_reference and "|" in raw_key:
+        raw_cells = [normalize_text(cell) for cell in raw_key.split("|")]
+        if len(raw_cells) > 1 and re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9-]{8,}", raw_cells[1]):
+            event_reference = raw_cells[1]
     counterparty = re.sub(r"\s+", "", normalize_text(txn.get("counterparty")))
     if balance is not None:
         return (
@@ -3632,7 +3742,7 @@ def transaction_fingerprint(txn: dict) -> tuple:
             account,
             date,
             event_time,
-            event_id,
+            event_reference or event_id,
             income,
             expense,
             round(float(balance), 2),
@@ -3845,7 +3955,17 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
         if progress:
             progress(10, "检查 PDF 文字层")
         quick_text, quick_password = extract_pdf_quick_text(path, passwords=passwords, should_cancel=should_cancel)
-        if is_shanghai_bank_detail_statement(quick_text, path.name):
+        if is_citic_corporate_account_statement(quick_text, path.name):
+            if progress:
+                progress(12, "解析中信银行企业流水")
+            txns, used_password, text = extract_citic_corporate_account_pdf(
+                path,
+                passwords=[quick_password] if quick_password else passwords,
+                should_cancel=should_cancel,
+                progress=progress,
+            )
+            source_mode = "PDF表格-中信银行账户交易明细"
+        elif is_shanghai_bank_detail_statement(quick_text, path.name):
             if progress:
                 progress(12, "解析上海银行表格流水")
             txns, used_password, text = extract_shanghai_bank_detail_pdf(
