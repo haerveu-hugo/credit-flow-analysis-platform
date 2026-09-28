@@ -245,18 +245,22 @@ def parse_simple_loans(text: str):
     section = inline
     loans = []
     direct_pattern = re.compile(
-        r'(\d{4}年\d{2}月\d{2}日)([^.。]{2,100}?)发放的([\d,]+)元（人民币）'
-        r'(个人住房商业贷款|个人经营性贷款|个人汽车消费贷款|其他个人消费贷款|其他贷款)'
-        r'.*?截至(\d{4}年\d{2}月),余额(?:为)?([\d,]+)',
+        r'(?P<date>\d{4}年\d{2}月\d{2}日)(?P<lender>[^.。]{2,100}?)发放的'
+        r'(?P<limit>[\d,]+)元（人民币）'
+        r'(?P<type>个人住房商业贷款|个人经营性贷款|经营性农户贷款|个人农户贷款|个人汽车消费贷款|其他个人消费贷款|其他贷款)'
+        r'(?P<body>.*?)(?=(?:20\d{2}年\d{2}月\d{2}日[^.。]{2,100}?发放的)|相关还款责任信息|$)',
     )
     for match in direct_pattern.finditer(section):
-        raw = match.group(0)
+        raw = match.group('body')
         if '已结清' in raw or '销户' in raw:
             continue
-        lender = match.group(2)[-40:]
-        limit = ocr_money(match.group(3) or '')
-        type_ = match.group(4) or '贷款'
-        balance = ocr_money(match.group(6))
+        balance_match = re.search(r'截至(\d{4}年\d{2}月),余额(?:为)?([\d,]+)', raw)
+        if not balance_match:
+            continue
+        lender = match.group('lender')[-40:]
+        limit = ocr_money(match.group('limit') or '')
+        type_ = match.group('type') or '贷款'
+        balance = ocr_money(balance_match.group(2))
         if balance > 0 or limit > 0:
             loans.append({
                 'lender': lender or '未识别',
@@ -317,6 +321,33 @@ def parse_simple_loans(text: str):
             'monthly_payment': 0,
         })
     return loans
+
+
+def parse_simple_guarantees(text: str) -> list[dict]:
+    """解析个人征信文字版中的对外担保/相关还款责任段。"""
+    inline = normalize_inline(text).replace('，', ',')
+    guarantees = []
+    pattern = re.compile(
+        r'为(?P<borrower>[\u4e00-\u9fffA-Za-z0-9]{4,80}?(?:有限公司|公司))'
+        r'(?:（[^）]{0,220}）)?在(?P<lender>[^，。]{4,100}?)办理的贷款承担相关还款责任'
+        r'.{0,100}?责任人类型为(?P<role>保证人|共同借款人)'
+        r'.{0,100}?相关还款责任金额(?P<amount>[\d,]+)'
+        r'.{0,240}?截至(?P<date>20\d{2}年\d{2}月\d{2}日),贷款余额(?P<balance>[\d,]+)'
+    )
+    for match in pattern.finditer(inline):
+        borrower = normalize_org_name(match.group('borrower')) or '未识别'
+        lender = normalize_org_name(match.group('lender')) or '未识别'
+        guarantee_amount = ocr_money(match.group('amount'))
+        balance = ocr_money(match.group('balance'))
+        if guarantee_amount <= 0 and balance <= 0:
+            continue
+        guarantees.append({
+            'main_borrower': borrower,
+            'lender': lender,
+            'guarantee_amount': guarantee_amount,
+            'balance': balance,
+        })
+    return guarantees
 
 
 def parse_simple_other_business(text: str) -> list[dict]:
@@ -1631,6 +1662,16 @@ def parse(path):
         personal_name = name_match.group(1)
     loans = parse_loan_accounts(lines)
     guarantees = parse_guarantee_accounts(lines)
+    simple_guarantees = parse_simple_guarantees(normalized)
+    existing_guarantees = {
+        (item.get('main_borrower'), item.get('lender'), round(float(item.get('balance') or 0), 2))
+        for item in guarantees
+    }
+    for item in simple_guarantees:
+        key = (item.get('main_borrower'), item.get('lender'), round(float(item.get('balance') or 0), 2))
+        if key not in existing_guarantees:
+            guarantees.append(item)
+            existing_guarantees.add(key)
     correct_guarantee_borrowers(lines, guarantees)
     if guarantees:
         borrowers = [item['main_borrower'] for item in guarantees if item.get('main_borrower') and item.get('main_borrower') != '未识别']

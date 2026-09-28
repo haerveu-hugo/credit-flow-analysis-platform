@@ -2925,15 +2925,88 @@ def parse_bank_pipe_table_line(line: str, account: str, source: str) -> dict | N
         and re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", cells[4] or "")
         and cells[5] in {"借", "贷", "收入", "支出"}
     )
+    preserve_icbc_trailing_empty = bool(
+        len(cells) >= 10
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", cells[0] or "")
+    ) or preserve_icbc_leading_empty
     while cells and not cells[0] and not preserve_icbc_leading_empty:
         cells = cells[1:]
-    while cells and not cells[-1]:
+    while cells and not cells[-1] and not preserve_icbc_trailing_empty:
         cells = cells[:-1]
     if is_summary_row(cells) or len(cells) < 5:
         return None
     header_text = "".join(cells[:5])
     if re.search(r"交易时\s*间|交易时间|交易日期|会计日期|交易金额|流水号收入|借方发生额|贷方发生额", header_text):
         return None
+
+    # 工行企业明细（新版横表）：交易时间 | 摘要 | 转入金额 | 转出金额 |
+    # 余额 | 用途 | 对方账号 | 对方单位 | 对方行号 | 附言。
+    if (
+        len(cells) >= 10
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", cells[0])
+        and money_to_float(cells[4]) is not None
+        and (not cells[2] or money_to_float(cells[2]) is not None)
+        and (not cells[3] or money_to_float(cells[3]) is not None)
+    ):
+        income = money_to_float(cells[2])
+        expense = money_to_float(cells[3])
+        if not income and not expense:
+            return None
+        counterparty_account = re.sub(r"\s+", "", cells[6])
+        counterparty = clean_counterparty_text(cells[7] or counterparty_account or "工商银行")
+        summary = " ".join(
+            part
+            for part in [cells[1], cells[5], cells[9], f"对方账号:{counterparty_account}" if counterparty_account else ""]
+            if part
+        )
+        return make_txn(
+            date=parse_date(cells[0]),
+            account=account,
+            counterparty=counterparty,
+            summary=summary,
+            income=income,
+            expense=expense,
+            amount=None,
+            balance=money_to_float(cells[4]),
+            source=source,
+            raw_key=line,
+            preserve_signed_columns=True,
+        )
+
+    # 工行企业明细（新版竖表）：对方账号 | 交易时间 | 借贷标志 |
+    # 对方单位 | 对方行号 | 摘要 | 附言 | 发生额 | 余额。
+    if (
+        len(cells) >= 9
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", cells[1])
+        and cells[2] in {"借", "贷", "收入", "支出"}
+        and money_to_float(cells[7]) is not None
+        and money_to_float(cells[8]) is not None
+    ):
+        amount = abs(float(money_to_float(cells[7]) or 0))
+        if amount <= 0:
+            return None
+        income = amount if cells[2] in {"贷", "收入"} else None
+        expense = amount if cells[2] in {"借", "支出"} else None
+        counterparty_account = re.sub(r"\s+", "", cells[0])
+        counterparty = clean_counterparty_text(cells[3] or counterparty_account or "工商银行")
+        summary = " ".join(
+            part
+            for part in [cells[5], cells[6], f"对方账号:{counterparty_account}" if counterparty_account else ""]
+            if part
+        )
+        return make_txn(
+            date=parse_date(cells[1]),
+            account=account,
+            counterparty=counterparty,
+            summary=summary,
+            income=income,
+            expense=expense,
+            amount=None,
+            balance=money_to_float(cells[8]),
+            source=source,
+            raw_key=line,
+            preserve_signed_columns=True,
+        )
 
     # 工行新版企业账户明细清单：对方账号 | 转入金额 | 转出金额 | 余额 |
     # 交易时间 | 借贷标志 | 对方单位 | 用途 | 摘要 | 附言 | 入账日期。
@@ -3859,6 +3932,7 @@ def extract_text_transactions(text: str, source: str, should_cancel=None) -> lis
         re.search(r"交易日期[^\n|]*\|[^\n]*(?:交易金额|Transaction Amount)", text)
         or re.search(r"(?m)^[^\n]*(?:交易日期|交易时间|交易流水)[^\n]*\|[^\n]*(?:交易金额|借方|贷方|余额)", text)
         or re.search(r"对方账号\s*\|\s*转入金额\s*\|\s*转出金额\s*\|\s*余额\s*\|\s*交易时间", text)
+        or re.search(r"对方账号\s*\|\s*交易时间\s*\|\s*借贷标志\s*\|.*发生额\s*\|\s*余额", text)
     ) or alipay_mode
     # 中国银行导出的文本同时含有视觉文本和表格文本；只解析带竖线的表格行，
     # 避免同一笔交易被两套文本层重复计入。
@@ -4135,7 +4209,11 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
                 txns = extract_text_transactions(text, path.name, should_cancel=should_cancel)
                 if (
                     "中国工商银行账户明细清单" in text
-                    and "对方账号 | 转入金额 | 转出金额 | 余额 | 交易时间 | 借贷标志" in text
+                    and (
+                        "对方账号 | 转入金额 | 转出金额 | 余额 | 交易时间 | 借贷标志" in text
+                        or "交易时间 | 摘要 | 转入金额 | 转出金额 | 余额" in text
+                        or "对方账号 | 交易时间 | 借贷标志 | 对方单位" in text
+                    )
                 ):
                     source_mode = "PDF表格-工行企业账户明细"
         text_length = len(text)
