@@ -134,7 +134,7 @@ def parse_summary(lines):
     result = {
         'report_date': '',
         'loan_summary': {'non_revolving_balance': 0, 'non_revolving_monthly': 0, 'revolving_balance': 0, 'revolving_monthly': 0},
-        'card_summary': {'total_limit': 0, 'used': 0, 'last6_avg_used': 0},
+        'card_summary': {'total_limit': 0, 'balance': 0, 'used': 0, 'unbilled_installment_balance': 0, 'last6_avg_used': 0},
         'guarantee_summary': {'count': 0, 'guarantee_amount': 0, 'balance': 0, 'main_borrower': ''},
         'inquiries': {'last_month_loan': 0, 'last_month_card': 0, 'two_year_loan': 0, 'two_year_card': 0},
     }
@@ -237,6 +237,52 @@ def parse_simple_cards(text: str):
             if limit > 0 and 0 <= used <= max(limit * 2, limit + 100_000):
                 cards.append({'lender': '发卡机构未识别', 'limit': limit, 'used': used})
     return cards
+
+
+def parse_detailed_card_accounts(text: str):
+    """Parse the table-style credit-card account pages in a detailed report.
+
+    The detailed format prints a header row followed by a value row, then a
+    second row whose labels are ``余额 / 已用额度 / 未出账的大额专项分期余额``.
+    OCR may join or split those rows, so this accepts flexible whitespace and
+    only takes the three amounts immediately after that label row.
+    """
+    inline = clean(text).replace('，', ',').replace('未出单', '未出账').replace('未出帐', '未出账')
+    amount = r'(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)'
+    marker = re.compile(r'余额\s*已用额度\s*未出账(?:的)?大额专项分期余额')
+    accounts = []
+    starts = list(re.finditer(r'账户\d+', inline))
+    for index, start in enumerate(starts):
+        block = inline[start.start(): starts[index + 1].start() if index + 1 < len(starts) else len(inline)]
+        m = marker.search(block)
+        if not m:
+            continue
+        tail = block[m.end():m.end() + 180]
+        status = re.search(r'(?:正常|关注|次级|可疑|损失|逾期|销户|结清)', tail)
+        if status:
+            tail = tail[status.end():]
+        values = re.findall(amount, tail)
+        if len(values) < 3:
+            continue
+        balance, used, unbilled = (ocr_money(v) for v in values[:3])
+
+        # The account limit is printed between the opening date and currency.
+        limit = 0
+        limit_match = re.search(r'20\d{2}[.\-/]\d{2}[.\-/]\d{2}.{0,80}?(' + amount + r').{0,20}?人民币', block)
+        if limit_match:
+            limit = ocr_money(limit_match.group(1))
+        names = [n for n in re.findall(r'[\u4e00-\u9fff]{4,50}', block)
+                 if any(k in n for k in ('银行', '金融', '信用卡中心', '消费'))]
+        lender = max(names, key=len) if names else '发卡机构未识别'
+        lender = re.sub(r'^(?:发卡机构|账户授信额度|开立日期|到期日期)+', '', lender)
+        accounts.append({
+            'lender': lender,
+            'limit': limit,
+            'balance': balance,
+            'used': used,
+            'unbilled_installment_balance': unbilled,
+        })
+    return accounts
 
 
 def parse_simple_loans(text: str):
@@ -890,9 +936,12 @@ def dedupe_simple_cards(items: list[dict]) -> list[dict]:
     for item in items:
         lender = normalize_org_name((item.get('lender') or '').replace('信用中心', '信用卡中心'))
         normalized = {**item, 'lender': lender or item.get('lender') or '未识别'}
-        key = (round(float(normalized.get('limit') or 0), 2), round(float(normalized.get('used') or 0), 2))
+        key = (round(float(normalized.get('limit') or 0), 2), round(float(normalized.get('used') or 0), 2),
+               round(float(normalized.get('balance') or 0), 2), round(float(normalized.get('unbilled_installment_balance') or 0), 2))
         old = dedup.get(key)
-        if not old or lender_quality(normalized.get('lender') or '') > lender_quality(old.get('lender') or ''):
+        new_quality = lender_quality(normalized.get('lender') or '') + sum(1 for k in ('balance', 'unbilled_installment_balance') if normalized.get(k) is not None)
+        old_quality = lender_quality(old.get('lender') or '') + sum(1 for k in ('balance', 'unbilled_installment_balance') if old and old.get(k) is not None)
+        if not old or new_quality > old_quality:
             dedup[key] = normalized
     return list(dedup.values())
 
@@ -1470,7 +1519,7 @@ def parse_enterprise(path, raw, normalized, lines):
         'summary': {
             'report_date': identity.get('report_date', ''),
             'loan_summary': {},
-            'card_summary': {'total_limit': 0, 'used': 0, 'last6_avg_used': 0},
+            'card_summary': {'total_limit': 0, 'balance': 0, 'used': 0, 'unbilled_installment_balance': 0, 'last6_avg_used': 0},
             'guarantee_summary': {'count': len(off_balance), 'guarantee_amount': 0, 'balance': summary.get('guarantee_balance', 0), 'main_borrower': ''},
             'inquiries': {},
         },
@@ -1683,13 +1732,19 @@ def parse(path):
             summary['guarantee_summary']['balance'] = sum(item.get('balance', 0) for item in guarantees)
         elif len(guarantees) == 1 and guarantees[0].get('balance', 0) < summary['guarantee_summary']['balance'] * 0.2:
             guarantees[0]['balance'] = summary['guarantee_summary']['balance']
-    simple_cards = dedupe_simple_cards(parse_simple_cards(normalized))
-    if simple_cards and summary['card_summary']['total_limit'] == 0:
-        summary['card_summary'] = {
-            'total_limit': sum(item['limit'] for item in simple_cards),
-            'used': sum(item['used'] for item in simple_cards),
-            'last6_avg_used': 0,
-        }
+    simple_cards = dedupe_simple_cards(parse_simple_cards(normalized) + parse_detailed_card_accounts(normalized))
+    if simple_cards:
+        card_summary = summary['card_summary']
+        limits = sum(item.get('limit', 0) for item in simple_cards)
+        balances = sum(item.get('balance', 0) for item in simple_cards)
+        used = sum(item.get('used', 0) for item in simple_cards)
+        unbilled = sum(item.get('unbilled_installment_balance', 0) for item in simple_cards)
+        if not card_summary.get('total_limit'):
+            card_summary['total_limit'] = limits
+        if not card_summary.get('used'):
+            card_summary['used'] = used
+        card_summary['balance'] = balances
+        card_summary['unbilled_installment_balance'] = unbilled
     simple_loans = dedupe_personal_loans(parse_simple_loans(normalized))
     other_business = parse_simple_other_business(normalized)
     if simple_loans:

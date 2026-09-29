@@ -312,12 +312,13 @@ def make_report(data: dict) -> str:
     ) or '<tr><td colspan="6">未识别到逾期贷款</td></tr>'
 
     card_rows = "".join(
-        f"<tr><td>{html.escape(item['lender'])}</td><td>{money(item['limit'])}</td><td>{money(item['used'])}</td>"
-        f"<td>{(item['used'] / item['limit'] if item['limit'] else 0):.1%}</td></tr>"
+        f"<tr><td>{html.escape(item['lender'])}</td><td>{money(item.get('limit'))}</td><td>{money(item.get('balance'))}</td>"
+        f"<td>{money(item.get('used'))}</td><td>{money(item.get('unbilled_installment_balance'))}</td>"
+        f"<td>{(item.get('used', 0) / item.get('limit', 0) if item.get('limit') else 0):.1%}</td></tr>"
         for item in data.get("cards", [])
     )
     card_detail = (
-        f"<h3>信用卡明细</h3><table><thead><tr><th>发卡机构</th><th>信用额度</th><th>已使用额度</th><th>使用率</th></tr></thead><tbody>{card_rows}</tbody></table>"
+        f"<h3>信用卡明细</h3><table><thead><tr><th>发卡机构</th><th>授信额度</th><th>余额</th><th>已用额度</th><th>未出账大额分期余额</th><th>使用率</th></tr></thead><tbody>{card_rows}</tbody></table>"
         if card_rows else ""
     )
 
@@ -357,8 +358,8 @@ def make_report(data: dict) -> str:
       <h3>逾期贷款明细</h3>
       <table><thead><tr><th>贷款机构名称</th><th>业务种类</th><th>逾期月份</th><th>逾期程度</th><th>逾期金额</th><th>状态</th></tr></thead><tbody>{overdue_rows}</tbody></table>
       <h3>信用卡汇总</h3>
-      <table><thead><tr><th>授信总额</th><th>已使用额度</th><th>近6个月平均使用额度</th><th>使用率</th></tr></thead><tbody>
-      <tr><td>{money(card['total_limit'])}</td><td>{money(card['used'])}</td><td>{card_last6}</td><td>{card_rate:.1%}</td></tr>
+      <table><thead><tr><th>授信总额</th><th>余额</th><th>已用额度</th><th>未出账大额分期余额</th><th>近6个月平均使用额度</th><th>使用率</th></tr></thead><tbody>
+      <tr><td>{money(card['total_limit'])}</td><td>{money(card.get('balance'))}</td><td>{money(card['used'])}</td><td>{money(card.get('unbilled_installment_balance'))}</td><td>{card_last6}</td><td>{card_rate:.1%}</td></tr>
       </tbody></table>
       {card_detail}
       <h3>对外担保</h3>
@@ -597,7 +598,9 @@ def personal_export_blocks(data: dict) -> list[dict]:
             ["报告日期", summary.get("report_date") or "未识别"],
             ["贷款余额合计", sum(float(item.get("balance") or 0) for item in active_loans)],
             ["信用卡授信总额", card.get("total_limit") or 0],
+            ["信用卡余额", card.get("balance") or 0],
             ["信用卡已使用额度", card.get("used") or 0],
+            ["未出账大额分期余额", card.get("unbilled_installment_balance") or 0],
             ["对外担保余额", guarantee.get("balance") or 0],
             ["来源", data.get("source_mode") or "OCR识别"],
         ]),
@@ -624,11 +627,13 @@ def personal_export_blocks(data: dict) -> list[dict]:
             ]
             for item in overdue_entries
         ]),
-        table_block("信用卡明细", ["发卡机构", "信用额度", "已使用额度", "使用率"], [
+        table_block("信用卡明细", ["发卡机构", "授信额度", "余额", "已使用额度", "未出账大额分期余额", "使用率"], [
             [
                 item.get("lender") or "未识别",
                 to_export_number(item.get("limit")),
+                to_export_number(item.get("balance")),
                 to_export_number(item.get("used")),
+                to_export_number(item.get("unbilled_installment_balance")),
                 f"{(float(item.get('used') or 0) / float(item.get('limit') or 1)):.1%}" if float(item.get("limit") or 0) else "0.0%",
             ]
             for item in cards
