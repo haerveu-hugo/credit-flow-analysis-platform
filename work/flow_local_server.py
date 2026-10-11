@@ -1105,6 +1105,7 @@ def is_account_detail_query_result_statement(text: str, filename: str = "") -> b
 def is_citic_corporate_account_statement(text: str, filename: str = "") -> bool:
     """中信银行企业网银导出的横向九列账户交易明细。"""
     content = normalize_text(text)
+    name_hint = any(token in normalize_text(filename) for token in ("中信银行", "中信公户", "中信流水", "中信账户"))
     return bool(
         "账户交易明细" in content
         and "交易日期" in content
@@ -1112,7 +1113,7 @@ def is_citic_corporate_account_statement(text: str, filename: str = "") -> bool:
         and "对方账户名称" in content
         and "借方发生额" in content
         and "贷方发生额" in content
-        and ("中信银行" in content or "中信银行" in normalize_text(filename))
+        and ("中信银行" in content or name_hint)
     )
 
 
