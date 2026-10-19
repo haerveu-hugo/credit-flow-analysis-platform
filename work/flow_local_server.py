@@ -1117,6 +1117,17 @@ def is_citic_corporate_account_statement(text: str, filename: str = "") -> bool:
     )
 
 
+def is_statement_of_account_statement(text: str, filename: str = "") -> bool:
+    """佛山北滘等网银导出的 Statement Of Account 无边框文本表格。"""
+    content = normalize_text(text)
+    return bool(
+        "账务明细清单" in content
+        and "Statement Of Account" in content
+        and "借方/贷方金额" in content
+        and "对手户名" in content
+    )
+
+
 def extract_pdf_quick_text(
     path: Path,
     passwords: list[str] | None = None,
@@ -1412,6 +1423,70 @@ def extract_citic_corporate_account_pdf(
                             if txn:
                                 txns.append(txn)
             return dedupe_transactions(txns), password, quick_text
+        except Exception as exc:
+            last_error = str(exc)
+            if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
+                raise
+    if len(passwords) <= 1 and not passwords[0]:
+        raise PasswordRequiredError(path.name)
+    raise PasswordRequiredError(path.name, f"{path.name} 密码不正确，或还需要输入正确密码。")
+
+
+def extract_statement_of_account_pdf(
+    path: Path,
+    passwords: list[str] | None = None,
+    should_cancel=None,
+    progress=None,
+) -> tuple[list[dict], str, str]:
+    """Parse borderless Statement Of Account rows (YYYYMMDD ... amount balance)."""
+    passwords = passwords or [""]
+    last_error = ""
+    row_pattern = re.compile(
+        r"^(?P<date>20\d{6})\s+(?P<body>.*?)\s+(?P<amount>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2})\s+"
+        r"(?P<balance>(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2})\s*(?P<counterparty>.*)$"
+    )
+    for password in passwords:
+        try:
+            txns: list[dict] = []
+            chunks: list[str] = []
+            with pdfplumber.open(path, password=password or None) as pdf:
+                page_count = len(pdf.pages)
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    raise_if_cancelled(should_cancel)
+                    text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                    chunks.append(text)
+                    account = infer_account_from_text(text, infer_account_from_filename(path.name) or normalize_source_account(path.name))
+                    for raw_line in text.splitlines():
+                        line = normalize_text(raw_line)
+                        match = row_pattern.match(line)
+                        if not match:
+                            continue
+                        amount = money_to_float(match.group("amount")) or 0.0
+                        balance = money_to_float(match.group("balance"))
+                        if amount == 0 and balance is None:
+                            continue
+                        body = normalize_text(match.group("body"))
+                        counterparty = clean_counterparty_text(match.group("counterparty") or "")
+                        if counterparty == "未识别":
+                            counterparty = "银行账户交易"
+                        txn = make_txn(
+                            date=parse_date(match.group("date")),
+                            account=account,
+                            counterparty=counterparty,
+                            summary=body,
+                            income=abs(amount) if amount >= 0 else None,
+                            expense=abs(amount) if amount < 0 else None,
+                            amount=amount,
+                            balance=balance,
+                            source=path.name,
+                            raw_key=line,
+                            preserve_signed_columns=True,
+                        )
+                        if txn:
+                            txns.append(txn)
+                    if progress and (page_no == 1 or page_no == page_count):
+                        progress(12 + int(75 * page_no / max(page_count, 1)), f"读取账务明细 {page_no}/{page_count} 页")
+            return dedupe_transactions(txns), password, "\n".join(chunks)
         except Exception as exc:
             last_error = str(exc)
             if not re.search(r"password|encrypted|加密|密码", last_error, re.I):
@@ -4083,7 +4158,17 @@ def analyze_file(path: Path, progress=None, passwords: list[str] | None = None, 
         if progress:
             progress(10, "检查 PDF 文字层")
         quick_text, quick_password = extract_pdf_quick_text(path, passwords=passwords, should_cancel=should_cancel)
-        if is_citic_corporate_account_statement(quick_text, path.name):
+        if is_statement_of_account_statement(quick_text, path.name):
+            if progress:
+                progress(12, "解析账务明细清单")
+            txns, used_password, text = extract_statement_of_account_pdf(
+                path,
+                passwords=[quick_password] if quick_password else passwords,
+                should_cancel=should_cancel,
+                progress=progress,
+            )
+            source_mode = "PDF表格-账务明细清单"
+        elif is_citic_corporate_account_statement(quick_text, path.name):
             if progress:
                 progress(12, "解析中信银行企业流水")
             txns, used_password, text = extract_citic_corporate_account_pdf(
