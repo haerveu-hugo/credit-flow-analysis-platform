@@ -2575,6 +2575,43 @@ def extract_abc_account_detail_pdf(
                         },
                     )
                     starts = abc_account_detail_row_starts(words)
+                    # 有些农行公户回单把日期拆成逐字水印，文字层无法组成
+                    # ``20xx-xx-xx``，但横线仍保留。用表格线重建行列作为兜底。
+                    if not starts:
+                        table_settings = {
+                            "vertical_strategy": "explicit",
+                            "horizontal_strategy": "lines",
+                            "explicit_vertical_lines": [30, 92, 168, 240, 315, 386, 456, 523, 600],
+                        }
+                        for table in page.extract_tables(table_settings=table_settings) or []:
+                            for row in table[1:]:
+                                cells = [clean_table_cell_text(cell) for cell in (row or [])]
+                                if len(cells) < 4 or not re.search(r"20\d{2}-\d{2}-\d{2}", cells[0]):
+                                    continue
+                                date = parse_date(cells[0])
+                                income = money_to_float(cells[1]) if len(cells) > 1 else None
+                                expense = money_to_float(cells[2]) if len(cells) > 2 else None
+                                balance = money_to_float(cells[3]) if len(cells) > 3 else None
+                                if income is None and expense is None:
+                                    continue
+                                counterparty_account = re.sub(r"\D", "", cells[4] if len(cells) > 4 else "")
+                                counterparty = clean_counterparty_text(" ".join(cells[4:7]))
+                                txn = make_txn(
+                                    date=date,
+                                    account=account,
+                                    counterparty=counterparty or counterparty_account or "农业银行账户明细",
+                                    summary=cells[7] if len(cells) > 7 else "",
+                                    income=income,
+                                    expense=expense,
+                                    amount=None,
+                                    balance=balance,
+                                    source=path.name,
+                                    raw_key=f"abc-table:{page_no}:{cells}",
+                                    preserve_signed_columns=True,
+                                )
+                                if txn:
+                                    txns.append(txn)
+                        continue
                     for idx, (start_top, date_text) in enumerate(starts):
                         next_top = starts[idx + 1][0] if idx + 1 < len(starts) else float(page.height)
                         block_top = max(72.0, start_top - 13.0)
